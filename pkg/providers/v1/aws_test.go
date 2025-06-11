@@ -5022,3 +5022,305 @@ func TestIsOwnedSecurityGroup(t *testing.T) {
 		})
 	}
 }
+
+func TestBYOSecurityGroupIsolation(t *testing.T) {
+	// Test cases specifically for BYO Security Group isolation
+	// These tests ensure BYO SG functionality doesn't interfere with managed SG functionality
+
+	const (
+		byoSecurityGroupID = "sg-byo123456"
+		serviceName        = "test-service"
+	)
+
+	t.Run("BYO SG should not be marked as managed", func(t *testing.T) {
+		awsServices := newMockedFakeAWSServices(TestClusterID)
+		cfg := config.CloudConfig{}
+		c, err := newAWSCloud(cfg, awsServices)
+		assert.NoError(t, err)
+
+		// Mock security group without managed tag
+		awsServices.ec2.(*MockedFakeEC2).On("DescribeSecurityGroups", &ec2.DescribeSecurityGroupsInput{
+			GroupIds: []string{byoSecurityGroupID},
+		}).Return([]ec2types.SecurityGroup{
+			{
+				GroupId: aws.String(byoSecurityGroupID),
+				Tags: []ec2types.Tag{
+					{
+						Key:   aws.String("Name"),
+						Value: aws.String("user-created-sg"),
+					},
+					{
+						Key:   aws.String(fmt.Sprintf("kubernetes.io/cluster/%s", TestClusterID)),
+						Value: aws.String("shared"), // User-owned, not controller-owned
+					},
+				},
+			},
+		}, nil)
+
+		sg := &ec2types.SecurityGroup{
+			GroupId: aws.String(byoSecurityGroupID),
+			Tags: []ec2types.Tag{
+				{
+					Key:   aws.String("Name"),
+					Value: aws.String("user-created-sg"),
+				},
+			},
+		}
+
+		isOwned, err := c.isOwnedSecurityGroup(context.TODO(), *sg.GroupId)
+		assert.NoError(t, err)
+		assert.False(t, isOwned, "BYO security group should not be marked as owned by controller")
+	})
+
+	t.Run("BYO SG should not be deleted during cleanup", func(t *testing.T) {
+		awsServices := newMockedFakeAWSServices(TestClusterID)
+		cfg := config.CloudConfig{}
+		c, err := newAWSCloud(cfg, awsServices)
+		assert.NoError(t, err)
+
+		service := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: serviceName,
+				Annotations: map[string]string{
+					ServiceAnnotationLoadBalancerSecurityGroups: byoSecurityGroupID,
+				},
+			},
+		}
+
+		// Mock security group describe call - BYO SG without managed tags
+		awsServices.ec2.(*MockedFakeEC2).On("DescribeSecurityGroups", mock.MatchedBy(func(input *ec2.DescribeSecurityGroupsInput) bool {
+			return len(input.Filters) > 0 && input.Filters[0].Name != nil &&
+				*input.Filters[0].Name == "group-id" &&
+				len(input.Filters[0].Values) == 1 && input.Filters[0].Values[0] == byoSecurityGroupID
+		})).Return([]ec2types.SecurityGroup{
+			{
+				GroupId: aws.String(byoSecurityGroupID),
+				Tags: []ec2types.Tag{
+					{
+						Key:   aws.String(fmt.Sprintf("kubernetes.io/cluster/%s", TestClusterID)),
+						Value: aws.String("shared"), // Not owned
+					},
+				},
+			},
+		}, nil)
+
+		securityGroupIDs, taggedLBSecurityGroups, err := c.buildSecurityGroupsToDelete(context.TODO(), service, []string{byoSecurityGroupID})
+
+		assert.NoError(t, err)
+		assert.Empty(t, securityGroupIDs, "BYO security groups should not be marked for deletion")
+		assert.Contains(t, taggedLBSecurityGroups, byoSecurityGroupID, "BYO security group should be tracked but not deleted")
+	})
+
+	t.Run("Managed SG should be marked for deletion when controller-owned", func(t *testing.T) {
+		awsServices := newMockedFakeAWSServices(TestClusterID)
+		cfg := config.CloudConfig{}
+		c, err := newAWSCloud(cfg, awsServices)
+		assert.NoError(t, err)
+
+		managedSGID := "sg-managed123"
+
+		// Test security group with the managed tag (controller-created managed SG)
+		sg := &ec2types.SecurityGroup{
+			GroupId: aws.String(managedSGID),
+			Tags: []ec2types.Tag{
+				{
+					Key:   aws.String(fmt.Sprintf("kubernetes.io/cluster/%s", TestClusterID)),
+					Value: aws.String("owned"), // Controller-owned
+				},
+				{
+					Key:   aws.String("kubernetes.io/cloud-provider-aws/NLBSecurityGroupMode"),
+					Value: aws.String("Managed"),
+				},
+			},
+		}
+
+		// Mock DescribeSecurityGroups for isOwnedSecurityGroup call
+		awsServices.ec2.(*MockedFakeEC2).On("DescribeSecurityGroups", &ec2.DescribeSecurityGroupsInput{
+			GroupIds: []string{managedSGID},
+		}).Return([]ec2types.SecurityGroup{*sg}, nil)
+
+		isOwned, err := c.isOwnedSecurityGroup(context.TODO(), *sg.GroupId)
+		assert.NoError(t, err)
+		assert.True(t, isOwned, "Managed security group should be marked as owned by controller")
+
+		// Verify all mocks were called as expected
+		awsServices.ec2.(*MockedFakeEC2).AssertExpectations(t)
+	})
+}
+
+func TestBuildSecurityGroupRuleReferences(t *testing.T) {
+	tests := []struct {
+		name                       string
+		targetSGID                 string
+		mockSecurityGroups         []ec2types.SecurityGroup
+		expectError                bool
+		expectedGroupsHasTags      int
+		expectedLinkedPermissions  int
+		expectedTaggedGroupsWithSG int
+	}{
+		{
+			name:       "security group with references found",
+			targetSGID: "sg-target123",
+			mockSecurityGroups: []ec2types.SecurityGroup{
+				{
+					GroupId: aws.String("sg-ref1"),
+					Tags: []ec2types.Tag{
+						{
+							Key:   aws.String("kubernetes.io/cluster/test-cluster"),
+							Value: aws.String("owned"),
+						},
+					},
+					IpPermissions: []ec2types.IpPermission{
+						{
+							IpProtocol: aws.String("tcp"),
+							FromPort:   aws.Int32(80),
+							ToPort:     aws.Int32(80),
+							UserIdGroupPairs: []ec2types.UserIdGroupPair{
+								{
+									GroupId: aws.String("sg-target123"),
+								},
+							},
+						},
+					},
+				},
+				{
+					GroupId: aws.String("sg-ref2"),
+					Tags:    []ec2types.Tag{}, // No cluster tags
+					IpPermissions: []ec2types.IpPermission{
+						{
+							IpProtocol: aws.String("tcp"),
+							FromPort:   aws.Int32(443),
+							ToPort:     aws.Int32(443),
+							UserIdGroupPairs: []ec2types.UserIdGroupPair{
+								{
+									GroupId: aws.String("sg-target123"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError:                false,
+			expectedGroupsHasTags:      2, // Both groups should be in the map
+			expectedLinkedPermissions:  2, // Both groups should have linked permissions
+			expectedTaggedGroupsWithSG: 1, // Only one group with tags
+		},
+		{
+			name:                       "no security groups referencing target",
+			targetSGID:                 "sg-orphan123",
+			mockSecurityGroups:         []ec2types.SecurityGroup{},
+			expectError:                false,
+			expectedGroupsHasTags:      0,
+			expectedLinkedPermissions:  0,
+			expectedTaggedGroupsWithSG: 0,
+		},
+		{
+			name:        "error querying security groups",
+			targetSGID:  "sg-error123",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockedEC2API := newMockedEC2API()
+
+			if tt.expectError {
+				mockedEC2API.On("DescribeSecurityGroups", mock.MatchedBy(func(input *ec2.DescribeSecurityGroupsInput) bool {
+					return len(input.Filters) > 0 && len(input.Filters[0].Values) > 0 && input.Filters[0].Values[0] == tt.targetSGID
+				})).Return((*ec2.DescribeSecurityGroupsOutput)(nil), errors.New("AWS error"))
+			} else {
+				mockedEC2API.On("DescribeSecurityGroups", mock.MatchedBy(func(input *ec2.DescribeSecurityGroupsInput) bool {
+					return len(input.Filters) > 0 && len(input.Filters[0].Values) > 0 && input.Filters[0].Values[0] == tt.targetSGID
+				})).Return(&ec2.DescribeSecurityGroupsOutput{
+					SecurityGroups: tt.mockSecurityGroups,
+				}, nil)
+			}
+
+			cloud := &Cloud{
+				ec2: &awsSdkEC2{ec2: mockedEC2API},
+				tagging: awsTagging{
+					ClusterID: "test-cluster",
+				},
+			}
+
+			ctx := context.Background()
+			groupsHasTags, linkedPermissions, err := cloud.buildSecurityGroupRuleReferences(ctx, tt.targetSGID)
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectedGroupsHasTags, len(groupsHasTags))
+				assert.Equal(t, tt.expectedLinkedPermissions, len(linkedPermissions))
+
+				// Verify that tagged groups with SG references are correctly identified
+				taggedGroupsWithSG := 0
+				for _, hasTag := range groupsHasTags {
+					if hasTag {
+						taggedGroupsWithSG++
+					}
+				}
+				assert.Equal(t, tt.expectedTaggedGroupsWithSG, taggedGroupsWithSG)
+			}
+
+			mockedEC2API.AssertExpectations(t)
+		})
+	}
+}
+
+func TestRemoveOwnedSecurityGroups(t *testing.T) {
+	tests := []struct {
+		name               string
+		securityGroups     []string
+		expectedNotRemoved []string
+		expectedErrorCount int
+	}{
+		{
+			name:               "skip non-owned security groups",
+			securityGroups:     []string{"sg-byo1"},
+			expectedNotRemoved: []string{"sg-byo1"},
+			expectedErrorCount: 1, // Error for non-owned SG
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockedEC2API := newMockedEC2API()
+
+			cloud := &Cloud{
+				ec2: &awsSdkEC2{ec2: mockedEC2API},
+				tagging: awsTagging{
+					ClusterID: "test-cluster",
+				},
+			}
+
+			// Mock DescribeSecurityGroups for isOwnedSecurityGroup call
+			mockedEC2API.On("DescribeSecurityGroups", &ec2.DescribeSecurityGroupsInput{
+				GroupIds: []string{"sg-byo1"},
+			}).Return(&ec2.DescribeSecurityGroupsOutput{
+				SecurityGroups: []ec2types.SecurityGroup{
+					{
+						GroupId: aws.String("sg-byo1"),
+						Tags:    []ec2types.Tag{}, // No ownership tags
+					},
+				},
+			}, nil)
+
+			// Mock DescribeSecurityGroups for buildSecurityGroupRuleReferences call
+			mockedEC2API.On("DescribeSecurityGroups", mock.MatchedBy(func(input *ec2.DescribeSecurityGroupsInput) bool {
+				return len(input.Filters) > 0 && len(input.Filters[0].Values) > 0 && input.Filters[0].Values[0] == "sg-byo1"
+			})).Return(&ec2.DescribeSecurityGroupsOutput{
+				SecurityGroups: []ec2types.SecurityGroup{},
+			}, nil)
+
+			ctx := context.Background()
+			notRemoved, errs := cloud.removeOwnedSecurityGroups(ctx, "test-lb", tt.securityGroups)
+
+			assert.Equal(t, tt.expectedNotRemoved, notRemoved)
+			assert.Equal(t, tt.expectedErrorCount, len(errs))
+
+			mockedEC2API.AssertExpectations(t)
+		})
+	}
+}
