@@ -119,7 +119,7 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				framework.ExpectNoError(getLBTargetCount(context.TODO(), lbDNS, nodeDiscovery.Count), "AWS LB target count validation failed")
 			},
 		},
-		// hairpin connection tests for internal CLB and NLB services LBs.
+		// Hairpin connection test for CLB.
 		{
 			Name:           "internal should support hairpin connection",
 			ResourceSuffix: "hp-clb-int",
@@ -136,16 +136,14 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			HookInClusterTestReachableHTTP: true,
 			RequireAffinity:                true,
 		},
-		// FIXME: https://github.com/kubernetes/cloud-provider-aws/issues/1160
-		// Hairpin connection work with target type as instance only when preserve client IP is disabled.
-		// Currently CCM does not provide an interface to create a service with that setup, making an internal
-		// Service to fail.
+		// Hairpin connection test for NLB, target type as instance only when preserve client IP is disabled.
 		{
 			Name:           "NLB internal should support hairpin connection",
 			ResourceSuffix: "hp-nlb-int",
 			Annotations: map[string]string{
 				annotationLBType: "nlb",
-				"service.beta.kubernetes.io/aws-load-balancer-internal": "true",
+				"service.beta.kubernetes.io/aws-load-balancer-internal":                "true",
+				"service.beta.kubernetes.io/aws-load-balancer-target-group-attributes": "preserve_client_ip.enabled=false",
 			},
 			PostConfigService: func(cfg *configServiceLB, svc *v1.Service, nodeDiscovery ClusterNodeDiscovery) {
 				if svc.Annotations == nil {
@@ -156,7 +154,6 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			},
 			HookInClusterTestReachableHTTP: true,
 			RequireAffinity:                true,
-			SkipTestFailure:                true,
 		},
 	}
 
