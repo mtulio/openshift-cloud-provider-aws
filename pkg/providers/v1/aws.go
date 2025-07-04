@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -491,14 +492,28 @@ func init() {
 			return nil, err
 		}
 
-		sess, err := session.NewSessionWithOptions(session.Options{
+		opts := session.Options{
 			Config:            *aws.NewConfig().WithRegion(regionName).WithSTSRegionalEndpoint(endpoints.RegionalSTSEndpoint),
 			SharedConfigState: session.SharedConfigEnable,
-		})
+		}
+		// try to read the environment AWS_SHARED_CREDENTIALS_FILE if defined, use it
+		if sharedCredentialsFile := os.Getenv("AWS_SHARED_CREDENTIALS_FILE"); sharedCredentialsFile != "" {
+			fmt.Printf("\n>>> Setting up AWS_SHARED_CREDENTIALS_FILE=%s\n", sharedCredentialsFile)
+			opts.SharedConfigFiles = append(opts.SharedConfigFiles, sharedCredentialsFile)
+		}
+		sess, err := session.NewSessionWithOptions(opts)
 		if err != nil {
 			return nil, fmt.Errorf("unable to initialize AWS session: %v", err)
 		}
+		// Get caller identity with session
+		stsClient := sts.New(sess)
+		callerIdentity, err := stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
+		if err != nil {
+			return nil, fmt.Errorf("unable to get caller identity: %v", err)
+		}
+		klog.Infof("AWS caller identity: %v", callerIdentity)
 
+		klog.Infof("CONFIG: %v", cfg)
 		var creds *credentials.Credentials
 		var credsV2 *stscredsv2.AssumeRoleProvider
 		if cfg.Global.RoleARN != "" {
@@ -521,7 +536,8 @@ func init() {
 			}
 			credsV2 = stscredsv2.NewAssumeRoleProvider(stsClientv2, cfg.Global.RoleARN)
 		}
-
+		fmt.Println(creds)
+		fmt.Println(credsV2)
 		aws := newAWSSDKProvider(creds, credsV2, cfg)
 		return newAWSCloud2(*cfg, aws, aws, creds, credsV2)
 	})
