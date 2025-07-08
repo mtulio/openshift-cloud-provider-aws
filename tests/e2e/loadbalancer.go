@@ -33,6 +33,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 )
@@ -41,6 +44,8 @@ const (
 	annotationLBType             = "service.beta.kubernetes.io/aws-load-balancer-type"
 	annotationLBInternal         = "service.beta.kubernetes.io/aws-load-balancer-internal"
 	annotationLBTargetNodeLabels = "service.beta.kubernetes.io/aws-load-balancer-target-node-labels"
+	annotationLBSecurityGroups   = "service.beta.kubernetes.io/aws-load-balancer-security-groups"
+	nlbSecurityGroupModeManaged  = "Managed"
 )
 
 var (
@@ -110,6 +115,8 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			extraAnnotations: map[string]string{annotationLBType: "nlb"},
 			hookPostServiceConfig: func(cfg *e2eTestConfig) {
 				framework.Logf("running hook post-service-config patching service annotations to test node label selector")
+				cfg.discoverClusterWorkerNode()
+
 				if cfg.svc.Annotations == nil {
 					cfg.svc.Annotations = map[string]string{}
 				}
@@ -132,7 +139,10 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				annotationLBInternal: "true",
 			},
 			hookPostServiceConfig: func(cfg *e2eTestConfig) {
-				framework.Logf("running hook post-service-config patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+				framework.Logf("running hook post-service-config")
+				cfg.discoverClusterWorkerNode()
+				framework.Logf("patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+
 				if cfg.svc.Annotations == nil {
 					cfg.svc.Annotations = map[string]string{}
 				}
@@ -156,7 +166,10 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			},
 			listenerCount: 1,
 			hookPostServiceConfig: func(cfg *e2eTestConfig) {
-				framework.Logf("running hook post-service-config patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+				framework.Logf("running hook post-service-config")
+				cfg.discoverClusterWorkerNode()
+				framework.Logf("patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+
 				if cfg.svc.Annotations == nil {
 					cfg.svc.Annotations = map[string]string{}
 				}
@@ -166,16 +179,87 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			requireAffinity:                       true,
 			skipTestFailure:                       true,
 		},
+		// NLB with BYO Security Group annotation should use provided security group
+		{
+			name:           "NLB with BYO Security Group annotation should use provided security group",
+			resourceSuffix: "nlb-byo-sg",
+			extraAnnotations: map[string]string{
+				annotationLBType: "nlb",
+			},
+			hookPostServiceConfig: func(cfg *e2eTestConfig) {
+				framework.Logf("Creating a test security group for BYO SG scenario")
+
+				securityGroupName := "test-byo-sg-" + cfg.svc.Name
+				byoSGID, err := cfg.awsHelper.createSecurityGroup(securityGroupName, "BYO Security Group for e2e test")
+				framework.ExpectNoError(err, "Failed to create BYO security group")
+
+				// Store the SG ID for cleanup
+				cfg.byoSecurityGroupID = byoSGID
+
+				// Add the BYO security group annotation to the service
+				if cfg.svc.Annotations == nil {
+					cfg.svc.Annotations = make(map[string]string)
+				}
+				cfg.svc.Annotations[annotationLBSecurityGroups] = byoSGID
+
+				framework.Logf("Created BYO security group %s for service %s", byoSGID, cfg.svc.Name)
+			},
+			hookPostServiceCreate: func(cfg *e2eTestConfig) {
+				if len(cfg.svc.Status.LoadBalancer.Ingress) == 0 {
+					framework.Failf("No ingress found in LoadBalancer status for service %s/%s", cfg.svc.Namespace, cfg.svc.Name)
+				}
+				lbDNS := cfg.svc.Status.LoadBalancer.Ingress[0].Hostname
+
+				// Verify that the NLB is using the BYO security group
+				securityGroups, err := cfg.awsHelper.getLoadBalancerSecurityGroups(lbDNS)
+				framework.ExpectNoError(err, "Failed to get load balancer security groups")
+
+				framework.Logf("Load balancer %s has security groups: %v", lbDNS, securityGroups)
+
+				// Verify the BYO security group is attached
+				byoSGFound := false
+				for _, sgID := range securityGroups {
+					if sgID == cfg.byoSecurityGroupID {
+						byoSGFound = true
+						break
+					}
+				}
+
+				if !byoSGFound {
+					framework.Failf("BYO security group %s not found in load balancer security groups %v", cfg.byoSecurityGroupID, securityGroups)
+				}
+				framework.Logf("BYO security group %s found in load balancer security groups %v", cfg.byoSecurityGroupID, securityGroups)
+
+				// Verify no managed security groups were created (only BYO should be present)
+				for _, sgID := range securityGroups {
+					isManaged, err := cfg.awsHelper.isSecurityGroupManaged(sgID)
+					framework.ExpectNoError(err, "Failed to check if security group is managed")
+
+					if isManaged && sgID != cfg.byoSecurityGroupID {
+						framework.Failf("Found unexpected managed security group %s when BYO was specified", sgID)
+					}
+				}
+				framework.Logf("BYO security group validation passed using SG: %s", cfg.byoSecurityGroupID)
+
+				// Verify that the controller creates the inbound security group rules on BYO SG
+				ports := make([]int32, len(cfg.svc.Spec.Ports))
+				for i, port := range cfg.svc.Spec.Ports {
+					ports[i] = port.Port
+				}
+				err = cfg.awsHelper.validateSecurityGroupRules(cfg.byoSecurityGroupID, ports)
+				framework.ExpectNoError(err, "Failed to validate security group rules")
+				framework.Logf("Rules validation for BYO Security group passed using SG: %s", cfg.byoSecurityGroupID)
+			},
+		},
 	}
 
 	serviceNameBase := "lbconfig-test"
 	for _, tc := range cases {
 		It(tc.name, func() {
-			By("setting up test environment and discovering worker nodes")
-			e2e := newE2eTestConfig(cs)
-			e2e.discoverClusterWorkerNode()
+			By("setting up test environment")
 			framework.Logf("[SETUP] Test case: %s", tc.name)
-			framework.Logf("[SETUP] Worker nodes discovered: %d nodes, selector: %s, sample node: %s", e2e.nodeCount, e2e.nodeSelector, e2e.nodeSingleSample)
+			e2e := newE2eTestConfig(cs)
+			defer e2e.cleanup()
 
 			loadBalancerCreateTimeout := e2eservice.GetServiceLoadBalancerCreationTimeout(cs)
 			framework.Logf("[CONFIG] AWS load balancer timeout: %s", loadBalancerCreateTimeout)
@@ -208,8 +292,11 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			By("waiting for AWS load balancer provisioning")
 			var err error
 			e2e.svc, err = e2e.LBJig.WaitForLoadBalancer(loadBalancerCreateTimeout)
+			if err != nil {
+				framework.Logf("Error waiting for loadbalancer for service %q: %v", e2e.svc.Name, err)
+				collectEventsFromResource(e2e.ctx, e2e.kubeClient, e2e.LBJig.Namespace, e2e.LBJig.Name)
+			}
 			framework.ExpectNoError(err)
-			framework.Logf("[AWS] Load balancer provisioned successfully")
 
 			By("creating backend server pods")
 			_, err = e2e.LBJig.Run(e2e.buildReplicationController(tc.requireAffinity))
@@ -274,6 +361,12 @@ type e2eTestConfig struct {
 	ctx        context.Context
 	kubeClient clientset.Interface
 
+	// AWS helper
+	awsHelper *awsHelper
+
+	// AWS resources subject to cleanup
+	byoSecurityGroupID string
+
 	// service configuration
 	cfgPortCount          int
 	cfgPodPort            uint16
@@ -296,6 +389,9 @@ func newE2eTestConfig(cs clientset.Interface) *e2eTestConfig {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	_ = cancel // We'll let the test framework handle cleanup
 
+	h, err := newAWSHelper(ctx, cs)
+	framework.ExpectNoError(err, "Failed to create AWS helper")
+
 	return &e2eTestConfig{
 		kubeClient:     cs,
 		cfgPortCount:   2,
@@ -306,6 +402,21 @@ func newE2eTestConfig(cs clientset.Interface) *e2eTestConfig {
 			"aws-load-balancer-backend-protocol": "http",
 			"aws-load-balancer-ssl-ports":        "https",
 		},
+		awsHelper: h,
+	}
+}
+
+func (e *e2eTestConfig) cleanup() {
+	framework.Logf("Cleaning up e2e resources")
+	// Cleanup security group
+	if e.awsHelper != nil && e.byoSecurityGroupID != "" {
+		framework.Logf("Cleaning up security group %s", e.byoSecurityGroupID)
+		err := e.awsHelper.waitForSecurityGroupDeletion(e.byoSecurityGroupID, 5*time.Minute)
+		if err != nil {
+			framework.Logf("Failed to delete security group %s during cleanup: %v", e.byoSecurityGroupID, err)
+		} else {
+			framework.Logf("Successfully cleaned up security group %s", e.byoSecurityGroupID)
+		}
 	}
 }
 
@@ -444,6 +555,7 @@ func (e2e *e2eTestConfig) discoverClusterWorkerNode() {
 			e2e.nodeCount = len(nodeList.Items)
 			e2e.nodeSingleSample = workerNodeList[0]
 			e2e.nodeSelector = selector
+			framework.Logf("[SETUP] Worker nodes discovered: %d nodes, selector: %s, sample node: %s", e2e.nodeCount, e2e.nodeSelector, e2e.nodeSingleSample)
 			return
 		}
 	}
@@ -681,16 +793,7 @@ func inClusterTestReachableHTTP(cs clientset.Interface, namespace, nodeName, tar
 		}
 		if pendingCount%10 == 0 && pendingCount > 0 {
 			framework.Logf("Pod %s is pending for too long, checking events...", podName)
-			events, errE := cs.CoreV1().Events(namespace).List(context.TODO(), metav1.ListOptions{
-				FieldSelector: fmt.Sprintf("involvedObject.name=%s", podName),
-			})
-			if errE != nil {
-				framework.Logf("Failed to list events for pod %s: %v", podName, errE)
-			} else {
-				for _, event := range events.Items {
-					framework.Logf("Event: %s - %s", event.Reason, event.Message)
-				}
-			}
+			collectEventsFromResource(context.TODO(), cs, namespace, podName)
 		}
 		// frequently collect logs.
 		if waitCount > 0 && waitCount%4 == 0 {
@@ -736,4 +839,284 @@ func inClusterTestReachableHTTP(cs clientset.Interface, namespace, nodeName, tar
 	}
 
 	return nil
+}
+
+// awsHelper provides AWS API operations for e2e tests
+type awsHelper struct {
+	ctx         context.Context
+	ec2Client   *ec2.Client
+	elbv2Client *elbv2.Client
+
+	// Cluster information
+	clusterName     string
+	clusterTag      string
+	clusterTagValue string
+	vpcID           string
+	awsRegion       string
+}
+
+// newAWSHelper creates a new AWS helper with configured clients
+func newAWSHelper(ctx context.Context, cs clientset.Interface) (*awsHelper, error) {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to load AWS config: %v", err)
+	}
+
+	h := &awsHelper{
+		ctx:         ctx,
+		ec2Client:   ec2.NewFromConfig(cfg),
+		elbv2Client: elbv2.NewFromConfig(cfg),
+	}
+
+	err = h.discoverClusterTag(cs)
+	if err != nil {
+		return nil, fmt.Errorf("unable to find cluster tag: %v", err)
+	}
+
+	return h, nil
+}
+
+// getSecurityGroup gets a security group by ID
+func (h *awsHelper) getSecurityGroup(sgID string) (*ec2types.SecurityGroup, error) {
+	result, err := h.ec2Client.DescribeSecurityGroups(h.ctx, &ec2.DescribeSecurityGroupsInput{
+		GroupIds: []string{sgID},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(result.SecurityGroups) == 0 {
+		return nil, fmt.Errorf("security group %s not found", sgID)
+	}
+	return &result.SecurityGroups[0], nil
+}
+
+// waitForSecurityGroupDeletion attempts to delete a security group and waits for it to be deleted
+// It handles dependency violations when the SG is still attached to resources like load balancers
+func (h *awsHelper) waitForSecurityGroupDeletion(sgID string, timeout time.Duration) error {
+	return wait.PollImmediate(10*time.Second, timeout, func() (bool, error) {
+		_, err := h.getSecurityGroup(sgID)
+		if err != nil {
+			framework.Logf("Security group %s appears to be deleted: %v", sgID, err)
+			return true, nil
+		}
+
+		err = h.deleteSecurityGroup(sgID)
+		if err != nil {
+			// Check for dependency violation errors
+			if strings.Contains(err.Error(), "DependencyViolation") ||
+				strings.Contains(err.Error(), "InvalidGroup.InUse") ||
+				strings.Contains(err.Error(), "resource has a dependent object") {
+				framework.Logf("Security group %s still has dependencies, waiting... (%v)", sgID, err)
+				return false, nil // Continue waiting
+			}
+
+			// Check if it's already deleted
+			if strings.Contains(err.Error(), "InvalidGroup.NotFound") ||
+				strings.Contains(err.Error(), "InvalidGroupId.NotFound") {
+				framework.Logf("Security group %s is already deleted", sgID)
+				return true, nil
+			}
+
+			// For other errors, return the error
+			return false, err
+		}
+
+		// Successfully deleted
+		framework.Logf("Successfully deleted security group %s", sgID)
+		return true, nil
+	})
+}
+
+// isSecurityGroupManaged checks if a security group is managed by the controller
+// It checks for the cluster ownership tag to determine if the controller owns this security group
+func (h *awsHelper) isSecurityGroupManaged(sgID string) (bool, error) {
+	sg, err := h.getSecurityGroup(sgID)
+	if err != nil {
+		return false, err
+	}
+
+	// Check for cluster ownership tag - security groups owned by the controller
+	// have the cluster tag with "owned" value
+	clusterTagKey := fmt.Sprintf("kubernetes.io/cluster/%s", h.clusterName)
+	for _, tag := range sg.Tags {
+		if aws.ToString(tag.Key) == clusterTagKey &&
+			aws.ToString(tag.Value) == "owned" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// getLoadBalancerSecurityGroups gets security groups attached to a load balancer
+func (h *awsHelper) getLoadBalancerSecurityGroups(lbDNSName string) ([]string, error) {
+	// Get Load Balancer ARN from DNS name
+	describeLBs, err := h.elbv2Client.DescribeLoadBalancers(h.ctx, &elbv2.DescribeLoadBalancersInput{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe load balancers: %v", err)
+	}
+
+	for _, lb := range describeLBs.LoadBalancers {
+		if strings.EqualFold(aws.ToString(lb.DNSName), lbDNSName) {
+			return lb.SecurityGroups, nil
+		}
+	}
+	return nil, fmt.Errorf("load balancer with DNS %s not found", lbDNSName)
+}
+
+// validateSecurityGroupRules validates that security group has the expected ingress rules
+func (h *awsHelper) validateSecurityGroupRules(sgID string, expectedPorts []int32) error {
+	sg, err := h.getSecurityGroup(sgID)
+	if err != nil {
+		return err
+	}
+
+	foundPorts := make(map[int32]bool)
+	for _, rule := range sg.IpPermissions {
+		if rule.FromPort != nil && rule.ToPort != nil {
+			port := aws.ToInt32(rule.FromPort)
+			foundPorts[port] = true
+		}
+	}
+
+	for _, expectedPort := range expectedPorts {
+		if !foundPorts[expectedPort] {
+			return fmt.Errorf("expected port %d not found in security group %s rules", expectedPort, sgID)
+		}
+	}
+
+	return nil
+}
+
+// createSecurityGroup creates a new security group for testing purposes
+func (h *awsHelper) createSecurityGroup(name, description string) (string, error) {
+	result, err := h.ec2Client.CreateSecurityGroup(h.ctx, &ec2.CreateSecurityGroupInput{
+		GroupName:   aws.String(name),
+		Description: aws.String(description),
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeSecurityGroup,
+				Tags: []types.Tag{
+					{
+						Key:   aws.String("Name"),
+						Value: aws.String(name),
+					},
+					{
+						Key:   aws.String(fmt.Sprintf("kubernetes.io/cluster/%s", h.clusterName)),
+						Value: aws.String("shared"),
+					},
+				},
+			},
+		},
+		VpcId: aws.String(h.vpcID),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create security group: %v", err)
+	}
+
+	return aws.ToString(result.GroupId), nil
+}
+
+// deleteSecurityGroup deletes a security group
+func (h *awsHelper) deleteSecurityGroup(sgID string) error {
+	if _, err := h.ec2Client.DeleteSecurityGroup(h.ctx, &ec2.DeleteSecurityGroupInput{
+		GroupId: aws.String(sgID),
+	}); err != nil {
+		return fmt.Errorf("failed to delete security group %s: %v", sgID, err)
+	}
+
+	return nil
+}
+
+// discoverClusterTag discovers the cluster tag from a cluster.
+// The discover is done by looking up the EC2 instance tags with tag:Name prefix kubernetes.io/cluster.
+// The EC2 Instance ID is discovered from a cluster node object.
+// The cluster ID, VPC ID and cluster tag are discovered from the EC2 instance tags.
+// If is any error is found, the function returns an error.
+func (h *awsHelper) discoverClusterTag(cs clientset.Interface) error {
+	nodes, err := cs.CoreV1().Nodes().List(h.ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list nodes: %v", err)
+	}
+
+	var (
+		instanceID string
+	)
+
+	for _, node := range nodes.Items {
+		providerID := node.Spec.ProviderID
+		if providerID == "" {
+			framework.Logf("providerID %s is empty for node %s", providerID, node.Name)
+			continue
+		}
+		providerID = strings.Replace(providerID, "aws:///", "", 1)
+		if len(strings.Split(providerID, "/")) < 2 {
+			framework.Logf("providerID %s is not a valid EC2 instance ID", providerID)
+			continue
+		}
+		h.awsRegion = strings.Split(providerID, "/")[0]
+		instanceID = strings.Split(providerID, "/")[1]
+		if !strings.HasPrefix(instanceID, "i-") {
+			framework.Logf("instanceID %s is not a valid EC2 instance ID", instanceID)
+			continue
+		}
+		break
+	}
+
+	instance, err := h.ec2Client.DescribeInstances(h.ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to describe instances: %v", err)
+	}
+
+	clusterTagFound := false
+	for _, reservation := range instance.Reservations {
+		for _, tag := range reservation.Instances[0].Tags {
+			if strings.HasPrefix(aws.ToString(tag.Key), "kubernetes.io/cluster") {
+				h.clusterTag = aws.ToString(tag.Key)
+				h.clusterTagValue = aws.ToString(tag.Value)
+				clusterTagFound = true
+				break
+			}
+		}
+		if clusterTagFound {
+			break
+		}
+	}
+
+	if !clusterTagFound {
+		return fmt.Errorf("cluster tag not found in the instance %s", instanceID)
+	}
+
+	h.clusterName = strings.Split(h.clusterTag, "/")[2]
+	if h.clusterName == "" {
+		return fmt.Errorf("cluster name not found in the cluster tag %s", h.clusterTag)
+	}
+
+	// extract VPC ID from the Instance
+	for _, networkInterface := range instance.Reservations[0].Instances[0].NetworkInterfaces {
+		h.vpcID = aws.ToString(networkInterface.VpcId)
+		break
+	}
+
+	if h.vpcID == "" {
+		return fmt.Errorf("VPC ID not found in the instance %s", instanceID)
+	}
+
+	return nil
+}
+
+func collectEventsFromResource(ctx context.Context, cs clientset.Interface, resourceNamespace, resourceName string) {
+	framework.Logf("Collecting events for failed resource %q", resourceName)
+	events, err := cs.CoreV1().Events(resourceNamespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s", resourceName),
+	})
+	if err != nil {
+		framework.Logf("Failed to list events for resource %q: %v", resourceName, err)
+	} else {
+		framework.Logf("Events for failed resource %q:", resourceNamespace)
+		for _, event := range events.Items {
+			framework.Logf("Event: %s, %s, %s, %s", event.Type, event.Reason, event.InvolvedObject.Name, event.Message)
+		}
+	}
 }
