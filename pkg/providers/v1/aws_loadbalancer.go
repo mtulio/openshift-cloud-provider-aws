@@ -181,6 +181,18 @@ func (c *Cloud) ensureLoadBalancerv2(ctx context.Context, namespacedName types.N
 		// TODO: What happens if we have more than one subnet per AZ?
 		createRequest.SubnetMappings = createSubnetMappings(discoveredSubnetIDs, allocationIDs)
 
+		// Enable dualstack or ipv4 when annotation is present.
+		if ipAddressType, present := annotations[ServiceAnnotationLoadBalancerIPAddressType]; present {
+			switch ipAddressType {
+			case "dualstack":
+				createRequest.IpAddressType = elbv2types.IpAddressTypeDualstack
+			case "ipv4":
+				createRequest.IpAddressType = elbv2types.IpAddressTypeIpv4
+			default:
+				return nil, fmt.Errorf("error creating load balancer: invalid IP address type: %s", ipAddressType)
+			}
+		}
+
 		for k, v := range tags {
 			createRequest.Tags = append(createRequest.Tags, elbv2types.Tag{
 				Key: aws.String(k), Value: aws.String(v),
@@ -788,7 +800,7 @@ func (c *Cloud) chunkTargetDescriptions(targets []elbv2types.TargetDescription, 
 
 // updateInstanceSecurityGroupsForNLB will adjust securityGroup's settings to allow inbound traffic into instances from clientCIDRs and portMappings.
 // TIP: if either instances or clientCIDRs or portMappings are nil, then the securityGroup rules for lbName are cleared.
-func (c *Cloud) updateInstanceSecurityGroupsForNLB(ctx context.Context, lbName string, instances map[InstanceID]*ec2types.Instance, subnetCIDRs []string, clientCIDRs []string, portMappings []nlbPortMapping) error {
+func (c *Cloud) updateInstanceSecurityGroupsForNLB(ctx context.Context, lbName string, instances map[InstanceID]*ec2types.Instance, subnetCIDRs []string, clientCIDRs []string, portMappings []nlbPortMapping, isDualStack bool) error {
 	if c.cfg.Global.DisableSecurityGroupIngress {
 		return nil
 	}
@@ -850,18 +862,18 @@ func (c *Cloud) updateInstanceSecurityGroupsForNLB(ctx context.Context, lbName s
 				// If the client rule is 1) all addresses 2) tcp and 3) has same ports as the healthcheck,
 				// then the health rules are a subset of the client rule and are not needed.
 				if len(clientCIDRs) != 1 || clientCIDRs[0] != "0.0.0.0/0" || clientProtocol != "tcp" || !healthCheckPorts.Equal(clientPorts) {
-					if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, healthRuleAnnotation, "tcp", healthCheckPorts, subnetCIDRs); err != nil {
+					if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, healthRuleAnnotation, "tcp", healthCheckPorts, subnetCIDRs, isDualStack); err != nil {
 						return err
 					}
 				}
-				if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, clientRuleAnnotation, clientProtocol, clientPorts, clientCIDRs); err != nil {
+				if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, clientRuleAnnotation, clientProtocol, clientPorts, clientCIDRs, isDualStack); err != nil {
 					return err
 				}
 			} else {
-				if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, healthRuleAnnotation, "tcp", nil, nil); err != nil {
+				if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, healthRuleAnnotation, "tcp", nil, nil, isDualStack); err != nil {
 					return err
 				}
-				if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, clientRuleAnnotation, clientProtocol, nil, nil); err != nil {
+				if err := c.updateInstanceSecurityGroupForNLBTraffic(ctx, sgID, sgPerms, clientRuleAnnotation, clientProtocol, nil, nil, isDualStack); err != nil {
 					return err
 				}
 			}
@@ -877,21 +889,27 @@ func (c *Cloud) updateInstanceSecurityGroupsForNLB(ctx context.Context, lbName s
 
 // updateInstanceSecurityGroupForNLBTraffic will manage permissions set(identified by ruleDesc) on securityGroup to match desired set(allow protocol traffic from ports/cidr).
 // Note: sgPerms will be updated to reflect the current permission set on SG after update.
-func (c *Cloud) updateInstanceSecurityGroupForNLBTraffic(ctx context.Context, sgID string, sgPerms IPPermissionSet, ruleDesc string, protocol string, ports sets.Set[int32], cidrs []string) error {
+func (c *Cloud) updateInstanceSecurityGroupForNLBTraffic(ctx context.Context, sgID string, sgPerms IPPermissionSet, ruleDesc string, protocol string, ports sets.Set[int32], cidrs []string, isDualStack bool) error {
 	desiredPerms := NewIPPermissionSet()
 	for port := range ports {
 		for _, cidr := range cidrs {
-			desiredPerms.Insert(ec2types.IpPermission{
+			perms := ec2types.IpPermission{
 				IpProtocol: aws.String(protocol),
 				FromPort:   aws.Int32(int32(port)),
 				ToPort:     aws.Int32(int32(port)),
-				IpRanges: []ec2types.IpRange{
-					{
-						CidrIp:      aws.String(cidr),
-						Description: aws.String(ruleDesc),
-					},
-				},
-			})
+			}
+			if isDualStack {
+				perms.Ipv6Ranges = append(perms.Ipv6Ranges, ec2types.Ipv6Range{
+					CidrIpv6:    aws.String(cidr),
+					Description: aws.String(ruleDesc),
+				})
+			} else {
+				perms.IpRanges = append(perms.IpRanges, ec2types.IpRange{
+					CidrIp:      aws.String(cidr),
+					Description: aws.String(ruleDesc),
+				})
+			}
+			desiredPerms.Insert(perms)
 		}
 	}
 

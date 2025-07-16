@@ -221,6 +221,10 @@ const ServiceAnnotationLoadBalancerHCInterval = "service.beta.kubernetes.io/aws-
 // static IP addresses for the NLB. Only supported on elbv2 (NLB)
 const ServiceAnnotationLoadBalancerEIPAllocations = "service.beta.kubernetes.io/aws-load-balancer-eip-allocations"
 
+// ServiceAnnotationLoadBalancerIPAddressType is the annotation used on the
+// service to specify the IP address type for the NLB.
+const ServiceAnnotationLoadBalancerIPAddressType = "service.beta.kubernetes.io/aws-load-balancer-ip-address-type"
+
 // ServiceAnnotationLoadBalancerTargetNodeLabels is the annotation used on the service
 // to specify a comma-separated list of key-value pairs which will be used to select
 // the target nodes for the load balancer
@@ -1626,7 +1630,7 @@ func (c *Cloud) findSubnets(ctx context.Context) ([]ec2types.Subnet, error) {
 // Finds the subnets to use for an ELB we are creating.
 // Normal (Internet-facing) ELBs must use public subnets, so we skip private subnets.
 // Internal ELBs can use public or private subnets, but if we have a private subnet we should prefer that.
-func (c *Cloud) findELBSubnets(ctx context.Context, internalELB bool) ([]string, error) {
+func (c *Cloud) findELBSubnets(ctx context.Context, internalELB bool, isDualStack bool) ([]string, error) {
 	vpcIDFilter := newEc2Filter("vpc-id", c.vpcID)
 
 	subnets, err := c.findSubnets(ctx)
@@ -1659,8 +1663,17 @@ func (c *Cloud) findELBSubnets(ctx context.Context, internalELB bool) ([]string,
 			continue
 		}
 
+		isDualStackSubnet := false
+		if isPublic && isDualStack {
+			isDualStackSubnet = len(subnet.Ipv6CidrBlockAssociationSet) > 0
+		}
+
 		existing, exists := subnetsByAZ[az]
 		if !exists {
+			// TODO review if this logic is correct, and aligned what we want on subnet discovery with dualstack.
+			if isPublic && isDualStack && !isDualStackSubnet {
+				return nil, fmt.Errorf("error creating load balancer: dualstack ELB %q requires a subnet with an IPv6 CIDR block. Please add a subnet with an IPv6 CIDR block to the service %q or set the subnet annotations", id, internalELB, ServiceAnnotationLoadBalancerIPAddressType)
+			}
 			subnetsByAZ[az] = subnet
 			continue
 		}
@@ -1759,7 +1772,7 @@ func (c *Cloud) getLoadBalancerSubnets(ctx context.Context, service *v1.Service,
 	if exists := parseStringSliceAnnotation(service.Annotations, ServiceAnnotationLoadBalancerSubnets, &rawSubnetNameOrIDs); exists {
 		return c.resolveSubnetNameOrIDs(ctx, rawSubnetNameOrIDs)
 	}
-	return c.findELBSubnets(ctx, internalELB)
+	return c.findELBSubnets(ctx, internalELB, isDualStackService(service))
 }
 
 func (c *Cloud) resolveSubnetNameOrIDs(ctx context.Context, subnetNameOrIDs []string) ([]string, error) {
@@ -2284,8 +2297,11 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 		if len(sourceRangeCidrs) == 0 {
 			sourceRangeCidrs = append(sourceRangeCidrs, "0.0.0.0/0")
 		}
+		if isDualStackService(apiService) {
+			sourceRangeCidrs = append(sourceRangeCidrs, "::/0")
+		}
 
-		err = c.updateInstanceSecurityGroupsForNLB(ctx, loadBalancerName, instances, subnetCidrs, sourceRangeCidrs, v2Mappings)
+		err = c.updateInstanceSecurityGroupsForNLB(ctx, loadBalancerName, instances, subnetCidrs, sourceRangeCidrs, v2Mappings, isDualStackService(apiService))
 		if err != nil {
 			klog.Warningf("Error opening ingress rules for the load balancer to the instances: %q", err)
 			return nil, err
@@ -3024,7 +3040,7 @@ func (c *Cloud) EnsureLoadBalancerDeleted(ctx context.Context, clusterName strin
 			}
 		}
 
-		return c.updateInstanceSecurityGroupsForNLB(ctx, loadBalancerName, nil, nil, nil, nil)
+		return c.updateInstanceSecurityGroupsForNLB(ctx, loadBalancerName, nil, nil, nil, nil, isDualStackService(service))
 	}
 
 	lb, err := c.describeLoadBalancer(ctx, loadBalancerName)
@@ -3441,4 +3457,18 @@ func getRegionFromMetadata(ctx context.Context, cfg config.CloudConfig, metadata
 	}
 
 	return cfg.GetRegion(ctx, metadata)
+}
+
+// isDualStackService checks if the service is dual stack.
+// It checks the IPFamilyPolicy annotation and the ServiceAnnotationLoadBalancerIPAddressType annotation.
+func isDualStackService(s *v1.Service) bool {
+	// If the annotation is present and set to "dualstack", return true. It takes precedence over the IPFamilyPolicy service spec..
+	if ipAddressType, present := s.Annotations[ServiceAnnotationLoadBalancerIPAddressType]; present && ipAddressType == "dualstack" {
+		return true
+	}
+	if s.Spec.IPFamilyPolicy != nil &&
+		(*s.Spec.IPFamilyPolicy == v1.IPFamilyPolicyPreferDualStack || *s.Spec.IPFamilyPolicy == v1.IPFamilyPolicyRequireDualStack) {
+		return true
+	}
+	return false
 }

@@ -33,6 +33,7 @@ import (
 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/stretchr/testify/require"
 	"k8s.io/cloud-provider-aws/pkg/providers/v1/config"
 )
 
@@ -1070,6 +1071,128 @@ func TestCloud_computeTargetGroupExpectedTargets(t *testing.T) {
 			c := &Cloud{}
 			got := c.computeTargetGroupExpectedTargets(tt.args.instanceIDs, tt.args.port)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCloud_ensureLoadBalancerv2_IPAddressType(t *testing.T) {
+	tests := []struct {
+		name                  string
+		annotations           map[string]string
+		expectedIpAddressType elbv2types.IpAddressType
+		expectError           bool
+		expectedErrorContains string
+	}{
+		{
+			name: "dualstack IP address type",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerIPAddressType: "dualstack",
+			},
+			expectedIpAddressType: elbv2types.IpAddressTypeDualstack,
+			expectError:           false,
+		},
+		{
+			name: "ipv4 IP address type",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerIPAddressType: "ipv4",
+			},
+			expectedIpAddressType: elbv2types.IpAddressTypeIpv4,
+			expectError:           false,
+		},
+		{
+			name: "no IP address type annotation",
+			annotations: map[string]string{
+				"some-other-annotation": "value",
+			},
+			expectedIpAddressType: "",
+			expectError:           false,
+		},
+		{
+			name: "invalid IP address type",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerIPAddressType: "invalid-value",
+			},
+			expectedIpAddressType: "",
+			expectError:           true,
+			expectedErrorContains: "invalid IP address type: invalid-value",
+		},
+		{
+			name: "empty IP address type",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerIPAddressType: "",
+			},
+			expectedIpAddressType: "",
+			expectError:           true,
+			expectedErrorContains: "invalid IP address type:",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create mock AWS services
+			awsServices := NewFakeAWSServices(TestClusterID)
+
+			// Initialize MockedFakeELBV2 with required maps
+			mockELBv2 := &MockedFakeELBV2{
+				Tags:                   make(map[string][]elbv2types.Tag),
+				RegisteredInstances:    make(map[string][]string),
+				LoadBalancerAttributes: make(map[string]map[string]string),
+			}
+			awsServices.elbv2 = mockELBv2
+
+			// Create cloud instance
+			c, err := newAWSCloud(config.CloudConfig{}, awsServices)
+			require.NoError(t, err)
+
+			// Setup test data
+			namespacedName := types.NamespacedName{Namespace: "default", Name: "test-service"}
+			loadBalancerName := "test-lb"
+			mappings := []nlbPortMapping{
+				{
+					FrontendPort:     80,
+					FrontendProtocol: elbv2types.ProtocolEnumTcp,
+					TrafficPort:      8080,
+					TrafficProtocol:  elbv2types.ProtocolEnumTcp,
+					HealthCheckConfig: healthCheckConfig{
+						Port:               "8080",
+						Protocol:           elbv2types.ProtocolEnumTcp,
+						Interval:           30,
+						Timeout:            10,
+						HealthyThreshold:   3,
+						UnhealthyThreshold: 3,
+					},
+				},
+			}
+			instanceIDs := []string{"i-1234567890abcdef0"}
+			subnetIDs := []string{"subnet-12345"}
+			internalELB := false
+
+			// Execute the function
+			result, err := c.ensureLoadBalancerv2(context.TODO(), namespacedName, loadBalancerName, mappings, instanceIDs, subnetIDs, internalELB, tt.annotations)
+
+			// Verify results
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.expectedErrorContains != "" {
+					assert.Contains(t, err.Error(), tt.expectedErrorContains)
+				}
+				assert.Nil(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+
+				// Verify the IP address type was set correctly by checking the created load balancer
+				// The MockedFakeELBV2 stores created load balancers, so we can inspect them
+				require.Len(t, mockELBv2.LoadBalancers, 1, "Expected exactly one load balancer to be created")
+				createdLB := mockELBv2.LoadBalancers[0]
+
+				if tt.expectedIpAddressType != "" {
+					assert.Equal(t, tt.expectedIpAddressType, createdLB.IpAddressType, "IP address type should match expected value")
+				} else {
+					// When no annotation is provided, the field should not be set (empty string)
+					assert.Equal(t, "", string(createdLB.IpAddressType), "IP address type should not be set when annotation is not provided")
+				}
+			}
 		})
 	}
 }

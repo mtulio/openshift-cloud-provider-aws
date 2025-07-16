@@ -1089,7 +1089,7 @@ func Test_findELBSubnets(t *testing.T) {
 			for _, rt := range routeTables {
 				awsServices.ec2.CreateRouteTable(rt)
 			}
-			got, _ := c.findELBSubnets(context.TODO(), tt.internal)
+			got, _ := c.findELBSubnets(context.TODO(), tt.internal, false)
 			sort.Strings(tt.want)
 			sort.Strings(got)
 			assert.Equal(t, tt.want, got)
@@ -1239,7 +1239,7 @@ func TestSubnetIDsinVPC(t *testing.T) {
 		awsServices.ec2.CreateRouteTable(rt)
 	}
 
-	result, err := c.findELBSubnets(context.TODO(), false)
+	result, err := c.findELBSubnets(context.TODO(), false, false)
 	if err != nil {
 		t.Errorf("Error listing subnets: %v", err)
 		return
@@ -1269,7 +1269,7 @@ func TestSubnetIDsinVPC(t *testing.T) {
 		awsServices.ec2.CreateRouteTable(rt)
 	}
 
-	result, err = c.findELBSubnets(context.TODO(), false)
+	result, err = c.findELBSubnets(context.TODO(), false, false)
 	if err != nil {
 		t.Errorf("Error listing subnets: %v", err)
 		return
@@ -1315,7 +1315,7 @@ func TestSubnetIDsinVPC(t *testing.T) {
 		awsServices.ec2.CreateRouteTable(rt)
 	}
 
-	result, err = c.findELBSubnets(context.TODO(), false)
+	result, err = c.findELBSubnets(context.TODO(), false, false)
 	if err != nil {
 		t.Errorf("Error listing subnets: %v", err)
 		return
@@ -1362,7 +1362,7 @@ func TestSubnetIDsinVPC(t *testing.T) {
 	for _, rt := range constructedRouteTables {
 		awsServices.ec2.CreateRouteTable(rt)
 	}
-	result, err = c.findELBSubnets(context.TODO(), false)
+	result, err = c.findELBSubnets(context.TODO(), false, false)
 	if err != nil {
 		t.Errorf("Error listing subnets: %v", err)
 		return
@@ -2492,6 +2492,7 @@ func (m *MockedFakeELBV2) CreateLoadBalancer(ctx context.Context, input *elbv2.C
 		LoadBalancerName: input.Name,
 		Type:             elbv2types.LoadBalancerTypeEnumNetwork,
 		VpcId:            aws.String("vpc-abc123def456abc78"),
+		IpAddressType:    input.IpAddressType,
 		AvailabilityZones: []elbv2types.AvailabilityZone{
 			{
 				ZoneName: aws.String("us-west-2a"),

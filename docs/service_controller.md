@@ -33,3 +33,58 @@ The service controller is responsible for watch for service and node object chan
 | service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol              | [tcp\|http\|https]                  | tcp | NLB | Specifies the protocol to use for the target group health check. |
 | service.beta.kubernetes.io/aws-load-balancer-subnets                           | Comma-separated list                | -   | ELB,NLB | Specifies the Availability Zone configuration for the load balancer. The values are comma separated list of subnetID or subnetName from different AZs. |
 | service.beta.kubernetes.io/aws-load-balancer-target-node-labels                | Comma-separated list of key=value   | -   | ELB,NLB | Specifies a comma-separated list of key-value pairs which will be used to select the target nodes for the load balancer. |
+| service.beta.kubernetes.io/aws-load-balancer-ip-address-type | [ipv4\|dualstack] | ipv4 | NLB | IP Address Type used to create the Network Load Balancer (NLB). The subnet must have assigned valid IPv6 CIDR block. |
+| service.beta.kubernetes.io/target-group-ip-address-type | [ipv4\|ipv6] | ipv4 | NLB | IP Address Type used to create the Target Group (TG). Default is `ipv4`  |
+
+
+## Annotation Configuration
+
+### NLB dual-stack
+
+Proposed changes:
+- introduce annotations:
+    - `service.beta.kubernetes.io/aws-load-balancer-ip-address-type`: allowing users to provision Service NLB with frontend dual-stack support. Valid values: `ipv4` and `dualstack`. Default: `ipv4`
+    - `service.beta.kubernetes.io/target-group-ip-address-type`: allowing users to change the default target ip address type to `ipv6`. Valid values: `ipv4` and `ipv6`. Default: `ipv4`. Requires `aws-load-balancer-ip-address-type`
+
+Prerequisites:
+- VPC with a IPv6 CIDR block
+- Dual-stack subnets
+- Egress-only Internet Gateway (when using IPv6 in private subnets)
+- Routes assigned to the subnets used/discovered by controller
+
+Scenarios:
+- Public NLB dual-stack subnet with target IPv4 type instance
+- Public NLB dual-stack subnet with target IPv4 type ip
+- Public NLB dual-stack subnet with target IPv6 type instance (the targets must have an assigned primary IPv6 address)
+- Public NLB dual-stack subnet with target IPv6 type ip
+- Private NLB dual-stack subnet with target IPv4 type instance
+- Private NLB dual-stack subnet with target IPv4 type ip
+- Private NLB dual-stack subnet with target IPv6 type instance (the targets must have an assigned primary IPv6 address)
+- Private NLB dual-stack subnet with target IPv6 type ip
+
+Violations:
+- Single-stack IPv6 subnets must be rejected for NLBs
+- Service type-CLB must reject annotation ip-address-type
+- When target IPv6, the node must have the IPv6 interface as primary (?)
+- BYO Subnets must be considered (?) (is it currently supported on NLB?)
+- When target ipv6, the instances must be validated if there is ipv6 address available
+
+Open questions for CCM:
+- What is the default IP address type for the target (ipv4 or ipv6)? Should it be ipv4 and explicitly set ipv6 when user knows their environment have machines with primary ipv6? Is there issue when set ipv6 and machines are primary ipv4?
+- How to teach the controller to use target IPv6? How ALBC handles it?
+
+Red Hat OpenShift work:
+- Need to validate how Installer will set the cluster to validate if the CCM proposal meets the expectation of the product
+- What is the default IP address type for the target (ipv4 or ipv6)? Should it follow the same strategy of Installer's API flow?
+- Need to validate wether there are CIO changes to make sure controller sets the annotation to instruct the default router Service to provision dual-stack NLB.
+
+Red Hat Discussions:
+- https://redhat-internal.slack.com/archives/C05KZA3NVU6/p1754300967882369
+- https://github.com/openshift/enhancements/pull/1806
+
+Related AWS Documentation:
+- https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html#ip-address-type
+- https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-ip-address-type.html
+- https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-target-groups.html#target-group-ip-address-type
+- https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html#ipv6-addressing
+
