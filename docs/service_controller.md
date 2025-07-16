@@ -33,3 +33,30 @@ The service controller is responsible for watch for service and node object chan
 | service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol              | [tcp\|http\|https]                  | tcp | NLB | Specifies the protocol to use for the target group health check. |
 | service.beta.kubernetes.io/aws-load-balancer-subnets                           | Comma-separated list                | -   | ELB,NLB | Specifies the Availability Zone configuration for the load balancer. The values are comma separated list of subnetID or subnetName from different AZs. |
 | service.beta.kubernetes.io/aws-load-balancer-target-node-labels                | Comma-separated list of key=value   | -   | ELB,NLB | Specifies a comma-separated list of key-value pairs which will be used to select the target nodes for the load balancer. |
+| service.beta.kubernetes.io/aws-load-balancer-target-group-attributes          | Comma-separated list of key=value   | -   | NLB | Specifies a comma-separated list of key-value pairs which will be applied as target group attributes. For example: "preserve_client_ip.enabled=false" |
+
+
+## Target Group Attributes for Service type-loadBalancer NLB
+
+Valid Target Group attributes for annotation `service.beta.kubernetes.io/aws-load-balancer-target-group-attributes`:
+
+| Attribute | Values | Description |
+| -- | -- | -- |
+| preserve_client_ip.enabled | [true\|false] | Whether to preserve client IP addresses when terminating connections at the target group level |
+| proxy_protocol_v2.enabled | [true\|false] | Whether to enable proxy protocol v2 on the target group |
+
+Attributes are in format key=value, separated by comma.
+
+Example, to disable the attribute "Preserve client IP addresses" from a target group, add the following annotation to the Service:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: $SVC_NAME
+  namespace: ${APP_NAMESPACE}
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: preserve_client_ip.enabled=false,proxy_protocol_v2.enabled=true
+[...]
+```

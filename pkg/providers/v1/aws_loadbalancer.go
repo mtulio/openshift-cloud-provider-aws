@@ -493,6 +493,175 @@ func (c *Cloud) reconcileLBAttributes(ctx context.Context, loadBalancerArn strin
 			return fmt.Errorf("unable to update load balancer attributes during attribute sync: %q", err)
 		}
 	}
+
+	return c.reconcileTargetGroupAttributes(ctx, loadBalancerArn, annotations)
+}
+
+// buildTargetGroupAttributes parses target group attributes from service annotations and returns
+// a list of attributes that need to be updated based on the difference between current and desired state.
+//
+// This function:
+// 1. Extracts target group attributes from the ServiceAnnotationLoadBalancerTargetGroupAttributes annotation
+// 2. Validates the attribute names and values
+// 3. Compares them with existing attributes to determine what needs to be changed
+// 4. Returns only attributes that differ from current state to minimize unnecessary API calls
+//
+// Supported attributes:
+// - preserve_client_ip.enabled: true/false - whether to preserve client IP addresses
+// - proxy_protocol_v2.enabled: true/false - whether to enable proxy protocol v2
+//
+// Returns:
+// - []elbv2types.TargetGroupAttribute: list of attributes that need to be modified
+// - error: validation or parsing errors
+func (c *Cloud) buildTargetGroupAttributes(tgAttributes []elbv2types.TargetGroupAttribute, annotations map[string]string) ([]elbv2types.TargetGroupAttribute, error) {
+	if tgAttributes == nil {
+		return nil, fmt.Errorf("unable to build target group attributes: target group attributes are nil")
+	}
+
+	existingAttributes := make(map[string]string, len(tgAttributes))
+	for _, attr := range tgAttributes {
+		existingAttributes[aws.ToString(attr.Key)] = aws.ToString(attr.Value)
+	}
+	desiredAttributes := make(map[string]string, len(existingAttributes))
+
+	// extract desired attributes from annotations with validations.
+	if attributes, present := annotations[ServiceAnnotationLoadBalancerTargetGroupAttributes]; present {
+		attributes = strings.TrimSpace(attributes)
+		if len(attributes) == 0 {
+			// Empty annotation value, no attributes to process
+			klog.V(2).Infof("the annotation %s is empty, no attributes to process, skipping", ServiceAnnotationLoadBalancerTargetGroupAttributes)
+			return []elbv2types.TargetGroupAttribute{}, nil
+		}
+
+		// Parse and map the annotation attributes to the desired attributes.
+		// Attribute are in format key=value, separated by comma.
+		for _, attr := range strings.Split(attributes, ",") {
+			attr = strings.TrimSpace(attr)
+			if attr == "" {
+				continue // Skip empty attributes
+			}
+
+			parts := strings.SplitN(attr, "=", 2)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid target group attribute: %s", attr)
+			}
+			attrKey := parts[0]
+			attrValue := parts[1]
+
+			if _, ok := desiredAttributes[attrKey]; ok {
+				return nil, fmt.Errorf("target group attribute %s is already set", attrKey)
+			}
+
+			// prevent updating attributes without a change.
+			if value, ok := existingAttributes[attrKey]; ok {
+				if value == attrValue {
+					klog.V(2).Infof("skipping attribute %s because it is already set to %s", attrKey, attrValue)
+					continue
+				}
+			}
+
+			switch attrKey {
+			case TargetGroupAttributePreserveClientIPEnabled:
+				if attrValue != "true" && attrValue != "false" {
+					return nil, fmt.Errorf("invalid target group attribute value for %s: %s", attrKey, attrValue)
+				}
+				klog.V(2).Infof("setting target group attribute %s to %s", attrKey, attrValue)
+				desiredAttributes[attrKey] = attrValue
+
+			case TargetGroupAttributeProxyProtocolV2Enabled:
+				if attrValue != "true" && attrValue != "false" {
+					return nil, fmt.Errorf("invalid target group attribute value for %s: %s", attrKey, attrValue)
+				}
+				klog.V(2).Infof("setting target group attribute %s to %s", attrKey, attrValue)
+				desiredAttributes[attrKey] = attrValue
+
+			default:
+				return nil, fmt.Errorf("invalid target group attribute: %s", attrKey)
+			}
+		}
+	}
+
+	// TODO/QUESTION: do we need to restore the default value when the current attribute is not
+	// set in the desiredAttributes? (e.g. preserve_client_ip.enabled changed, but eventually updated/removed)
+
+	// Build final list
+	var changedList []elbv2types.TargetGroupAttribute
+	for key, value := range desiredAttributes {
+		changedList = append(changedList, elbv2types.TargetGroupAttribute{
+			Key:   aws.String(key),
+			Value: aws.String(value),
+		})
+	}
+
+	return changedList, nil
+}
+
+// reconcileTargetGroupAttributes ensures that target group attributes for all target groups
+// associated with a load balancer match the desired state specified in service annotations.
+//
+// This function:
+// 1. Retrieves all target groups associated with the load balancer
+// 2. For each target group, gets current attributes and compares with desired state
+// 3. Updates target group attributes only when changes are needed
+// 4. Processes all target groups even if some have no changes needed
+//
+// The function is called during load balancer reconciliation to ensure target group
+// attributes stay in sync with service annotations, supporting both creation and updates.
+//
+// IMPORTANT: When target groups are recreated (due to port/protocol/health check changes),
+// the new target groups start with AWS default attribute values. This function will
+// detect the difference and apply the desired attributes from annotations.
+//
+// Parameters:
+// - ctx: context for API calls
+// - loadBalancerArn: ARN of the load balancer whose target groups should be reconciled
+// - annotations: service annotations containing desired target group attributes
+//
+// Returns:
+// - error: if any target group attribute update fails
+func (c *Cloud) reconcileTargetGroupAttributes(ctx context.Context, loadBalancerArn string, annotations map[string]string) error {
+	if len(loadBalancerArn) == 0 {
+		return fmt.Errorf("unable to reconcile target group attributes: loadBalancerArn is required")
+	}
+	if len(annotations) == 0 {
+		return nil
+	}
+
+	describeTargetGroupsOutput, err := c.elbv2.DescribeTargetGroups(ctx, &elbv2.DescribeTargetGroupsInput{
+		LoadBalancerArn: aws.String(loadBalancerArn),
+	})
+	if err != nil {
+		return fmt.Errorf("unable to retrieve target groups during attribute sync: %q", err)
+	}
+
+	for _, targetGroup := range describeTargetGroupsOutput.TargetGroups {
+		tgAttributes, err := c.elbv2.DescribeTargetGroupAttributes(ctx, &elbv2.DescribeTargetGroupAttributesInput{
+			TargetGroupArn: targetGroup.TargetGroupArn,
+		})
+		if err != nil {
+			return fmt.Errorf("unable to retrieve target group attributes during attribute sync: %q", err)
+		}
+
+		desiredTargetGroupAttributes, err := c.buildTargetGroupAttributes(tgAttributes.Attributes, annotations)
+		if err != nil {
+			return err
+		}
+		klog.V(2).Infof("desiredTargetGroupAttributes for target group %s: %v", aws.ToString(targetGroup.TargetGroupArn), desiredTargetGroupAttributes)
+
+		// Attributes are global to the service, if there are no attributes to set, skip this target group.
+		if len(desiredTargetGroupAttributes) == 0 {
+			continue
+		}
+		// modify target group attributes
+		if _, err = c.elbv2.ModifyTargetGroupAttributes(ctx, &elbv2.ModifyTargetGroupAttributesInput{
+			TargetGroupArn: targetGroup.TargetGroupArn,
+			Attributes:     desiredTargetGroupAttributes,
+		}); err != nil {
+			return fmt.Errorf("unable to modify target group attributes during attribute sync: %q", err)
+		}
+		klog.V(2).Infof("Successfully updated target group attributes for %s", aws.ToString(targetGroup.TargetGroupArn))
+	}
+
 	return nil
 }
 
@@ -677,6 +846,8 @@ func (c *Cloud) ensureTargetGroup(ctx context.Context, targetGroup *elbv2types.T
 			dirty = true
 		}
 	}
+
+	// ensure target group attributes.
 
 	if dirty {
 		result, err := c.elbv2.DescribeTargetGroups(ctx, &elbv2.DescribeTargetGroupsInput{

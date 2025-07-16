@@ -1073,3 +1073,341 @@ func TestCloud_computeTargetGroupExpectedTargets(t *testing.T) {
 		})
 	}
 }
+
+func TestCloud_buildTargetGroupAttributes(t *testing.T) {
+	tests := []struct {
+		name               string
+		existingAttributes []elbv2types.TargetGroupAttribute
+		annotations        map[string]string
+		expectedAttributes []elbv2types.TargetGroupAttribute
+		expectedError      string
+	}{
+		{
+			name: "no target group attributes annotation",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("some_key"), Value: aws.String("some_value")},
+			},
+			annotations:        map[string]string{},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{},
+			expectedError:      "",
+		},
+		{
+			name: "valid preserve_client_ip.enabled=true",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("true")},
+			},
+			expectedError: "",
+		},
+		{
+			name: "valid preserve_client_ip.enabled=false",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("true")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=false",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			expectedError: "",
+		},
+		{
+			name: "valid proxy_protocol_v2.enabled=true",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "proxy_protocol_v2.enabled=true",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("true")},
+			},
+			expectedError: "",
+		},
+		{
+			name: "valid proxy_protocol_v2.enabled=false",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("true")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "proxy_protocol_v2.enabled=false",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("false")},
+			},
+			expectedError: "",
+		},
+		{
+			name: "multiple attributes",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true,proxy_protocol_v2.enabled=true",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("true")},
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("true")},
+			},
+			expectedError: "",
+		},
+		{
+			name: "no change needed - same values",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("true")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{},
+			expectedError:      "",
+		},
+		{
+			name: "invalid attribute key",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("some_key"), Value: aws.String("some_value")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "invalid_attribute=true",
+			},
+			expectedAttributes: nil,
+			expectedError:      "invalid target group attribute: invalid_attribute",
+		},
+		{
+			name: "invalid boolean value for preserve_client_ip.enabled",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=invalid",
+			},
+			expectedAttributes: nil,
+			expectedError:      "invalid target group attribute value: invalid",
+		},
+		{
+			name: "invalid boolean value for proxy_protocol_v2.enabled",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("proxy_protocol_v2.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "proxy_protocol_v2.enabled=maybe",
+			},
+			expectedAttributes: nil,
+			expectedError:      "invalid target group attribute value: maybe",
+		},
+		{
+			name: "duplicate attribute in annotation",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true,preserve_client_ip.enabled=false",
+			},
+			expectedAttributes: nil,
+			expectedError:      "target group attribute preserve_client_ip.enabled is already set",
+		},
+		{
+			name: "malformed attribute - missing value",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled",
+			},
+			expectedAttributes: nil,
+			expectedError:      "invalid target group attribute: preserve_client_ip.enabled",
+		},
+		{
+			name: "malformed attribute - no equals sign",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip_enabled_true",
+			},
+			expectedAttributes: nil,
+			expectedError:      "invalid target group attribute: preserve_client_ip_enabled_true",
+		},
+		{
+			name: "empty annotation value",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{},
+			expectedError:      "",
+		},
+		{
+			name:               "nil existing attributes",
+			existingAttributes: nil,
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true",
+			},
+			expectedAttributes: nil,
+			expectedError:      "unable to build target group attributes: target group attributes are nil",
+		},
+		{
+			name: "annotation with extra commas and spaces",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: " , preserve_client_ip.enabled=true,  ,  ",
+			},
+			expectedAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("true")},
+			},
+			expectedError: "",
+		},
+		{
+			name: "mixed valid and invalid attributes should fail fast",
+			existingAttributes: []elbv2types.TargetGroupAttribute{
+				{Key: aws.String("preserve_client_ip.enabled"), Value: aws.String("false")},
+			},
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true,invalid_attr=value",
+			},
+			expectedAttributes: nil,
+			expectedError:      "invalid target group attribute: invalid_attr",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Cloud{}
+			result, err := c.buildTargetGroupAttributes(tt.existingAttributes, tt.annotations)
+
+			if tt.expectedError != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedError)
+				assert.Nil(t, result)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, len(tt.expectedAttributes), len(result))
+
+				// Convert to maps for easier comparison since order might vary
+				expectedMap := make(map[string]string)
+				for _, attr := range tt.expectedAttributes {
+					expectedMap[aws.ToString(attr.Key)] = aws.ToString(attr.Value)
+				}
+
+				resultMap := make(map[string]string)
+				for _, attr := range result {
+					resultMap[aws.ToString(attr.Key)] = aws.ToString(attr.Value)
+				}
+
+				assert.Equal(t, expectedMap, resultMap)
+			}
+		})
+	}
+}
+
+func TestGetKeyValuePropertiesFromAnnotation_TargetGroupAttributes(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		annotation  string
+		expected    map[string]string
+	}{
+		{
+			name: "valid target group attributes",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true,proxy_protocol_v2.enabled=false",
+			},
+			annotation: ServiceAnnotationLoadBalancerTargetGroupAttributes,
+			expected: map[string]string{
+				"preserve_client_ip.enabled": "true",
+				"proxy_protocol_v2.enabled":  "false",
+			},
+		},
+		{
+			name: "single attribute",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "preserve_client_ip.enabled=true",
+			},
+			annotation: ServiceAnnotationLoadBalancerTargetGroupAttributes,
+			expected: map[string]string{
+				"preserve_client_ip.enabled": "true",
+			},
+		},
+		{
+			name: "empty annotation",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: "",
+			},
+			annotation: ServiceAnnotationLoadBalancerTargetGroupAttributes,
+			expected:   map[string]string{},
+		},
+		{
+			name: "annotation with spaces",
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerTargetGroupAttributes: " preserve_client_ip.enabled=true , proxy_protocol_v2.enabled=false ",
+			},
+			annotation: ServiceAnnotationLoadBalancerTargetGroupAttributes,
+			expected: map[string]string{
+				"preserve_client_ip.enabled": "true",
+				"proxy_protocol_v2.enabled":  "false",
+			},
+		},
+		{
+			name: "annotation not present",
+			annotations: map[string]string{
+				"other.annotation": "value",
+			},
+			annotation: ServiceAnnotationLoadBalancerTargetGroupAttributes,
+			expected:   map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getKeyValuePropertiesFromAnnotation(tt.annotations, tt.annotation)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestCloud_reconcileTargetGroupAttributes(t *testing.T) {
+	tests := []struct {
+		name            string
+		loadBalancerArn string
+		annotations     map[string]string
+		expectedError   string
+	}{
+		{
+			name:            "empty load balancer ARN should return error",
+			loadBalancerArn: "",
+			annotations:     map[string]string{},
+			expectedError:   "unable to reconcile target group attributes: loadBalancerArn is required",
+		},
+		{
+			name:            "empty annotations should return nil",
+			loadBalancerArn: "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/net/test-lb/1234567890123456",
+			annotations:     map[string]string{},
+			expectedError:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Cloud{}
+			err := c.reconcileTargetGroupAttributes(context.TODO(), tt.loadBalancerArn, tt.annotations)
+
+			if tt.expectedError != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.expectedError)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
