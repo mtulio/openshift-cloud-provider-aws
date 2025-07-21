@@ -15,6 +15,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -23,8 +24,11 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
@@ -50,6 +54,16 @@ var (
 	lookupNodeSelectors = []string{
 		"node-role.kubernetes.io/worker", // used in must distributions
 		"node-role.kubernetes.io/node",   // used in ccm-aws CI
+	}
+	patchDataOpenShiftClusterIngressControllerCreate = map[string]interface{}{
+		"spec": map[string]interface{}{
+			"endpointPublishingStrategy": map[string]interface{}{
+				"type": "Private",
+				"private": map[string]interface{}{
+					"protocol": "PROXY",
+				},
+			},
+		},
 	}
 )
 
@@ -80,6 +94,8 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 		listenerCount    int
 
 		// Hooks
+		// HookE2eInit hook run after the e2e test config is created.
+		hookE2eInit func(cfg *e2eTestConfig)
 		// HookPostServiceConfig hook runs after the service manifest is created, and before the service is created.
 		hookPostServiceConfig func(cfg *e2eTestConfig)
 		// HookPostServiceCreate hook runs after the test is run.
@@ -89,7 +105,6 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 
 		// Flags to override default test behavior.
 		overrideTestRunInClusterReachableHTTP bool
-		requireAffinity                       bool
 
 		// Test verification
 		skipTestFailure bool
@@ -132,6 +147,10 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			extraAnnotations: map[string]string{
 				annotationLBInternal: "true",
 			},
+			overrideTestRunInClusterReachableHTTP: true,
+			hookE2eInit: func(cfg *e2eTestConfig) {
+				cfg.useAffinity = true
+			},
 			hookPostServiceConfig: func(cfg *e2eTestConfig) {
 				framework.Logf("running hook post-service-config patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
 				if cfg.svc.Annotations == nil {
@@ -139,8 +158,6 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				}
 				cfg.svc.Annotations[annotationLBTargetNodeLabels] = fmt.Sprintf("kubernetes.io/hostname=%s", cfg.nodeSingleSample)
 			},
-			overrideTestRunInClusterReachableHTTP: true,
-			requireAffinity:                       true,
 		},
 		// Hairpining traffic test for NLB.
 		// The target type instance (default) sets the preserve client IP attribute to true,
@@ -154,7 +171,11 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				annotationLBInternal:              "true",
 				annotationLBTargetGroupAttributes: "preserve_client_ip.enabled=false",
 			},
-			listenerCount: 1,
+			listenerCount:                         1,
+			overrideTestRunInClusterReachableHTTP: true,
+			hookE2eInit: func(cfg *e2eTestConfig) {
+				cfg.useAffinity = true
+			},
 			hookPostServiceConfig: func(cfg *e2eTestConfig) {
 				framework.Logf("running hook post-service-config patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
 				if cfg.svc.Annotations == nil {
@@ -162,7 +183,6 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				}
 				cfg.svc.Annotations[annotationLBTargetNodeLabels] = fmt.Sprintf("kubernetes.io/hostname=%s", cfg.nodeSingleSample)
 			},
-			overrideTestRunInClusterReachableHTTP: true,
 			hookPreTest: func(e2e *e2eTestConfig) {
 				framework.Logf("running hook pre-test: verify target group attributes are set correctly to AWS resource")
 
@@ -210,16 +230,108 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 					}
 				}
 			},
-			requireAffinity: true,
+		},
+		// Hairpining traffic test for NLB with Proxy Protocol V2.
+		{
+			name:           "NLB internal should be reachable with hairpinning traffic with Proxy Protocol V2 and patch",
+			resourceSuffix: "hp-nlb-int-oc",
+			extraAnnotations: map[string]string{
+				annotationLBType:                  "nlb",
+				annotationLBInternal:              "true",
+				annotationLBTargetGroupAttributes: "preserve_client_ip.enabled=false,proxy_protocol_v2.enabled=true",
+			},
+			listenerCount:                         1,
+			overrideTestRunInClusterReachableHTTP: true,
+			hookE2eInit: func(cfg *e2eTestConfig) {
+				cfg.useAffinity = true
+				cfg.useProxyProtocolV2 = true
+			},
+			hookPostServiceConfig: func(cfg *e2eTestConfig) {
+				framework.Logf("running hook post-service-config patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+				if cfg.svc.Annotations == nil {
+					cfg.svc.Annotations = map[string]string{}
+				}
+				cfg.svc.Annotations[annotationLBTargetNodeLabels] = fmt.Sprintf("kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+			},
+		},
+		// Hairpining traffic test for NLB with Proxy Protocol V2.
+		// The target type instance (default) sets the preserve client IP attribute to true,
+		// the NLB target group attributes are set to preserve_client_ip.enabled=false to allow hairpining traffic.
+		// The test also enables Proxy Protocol V2 on the OpenShift router.
+		// FIXME: this test is not working as expected, it must be fixed.
+		// WIP NOTE: to use this feature we need to:
+		// 1. turn off CVO to prevent enforcing CIO: oc scale --replicas=0 deployment.apps/cluster-version-operator -n openshift-cluster-version
+		// 2. turn off  CIO to prevent enforcing router deployment: oc scale --replicas=0 deployment.apps/ingress-operator -n openshift-ingress-operator
+		// 3. enable the proxy protocol v2 on openshift router. It must be done through CIO, but I needed to change the deployment manuall adding the following environment variable:
+		// ROUTER_USE_PROXY_PROTOCOL=true
+		//
+		{
+			name:           "NLB internal should be reachable with hairpinning traffic with Proxy Protocol V2 enabled on OpenShift",
+			resourceSuffix: "hp-nlb-int-oc",
+			extraAnnotations: map[string]string{
+				annotationLBType:                  "nlb",
+				annotationLBInternal:              "true",
+				annotationLBTargetGroupAttributes: "preserve_client_ip.enabled=false,proxy_protocol_v2.enabled=true",
+				"traffic-policy.network.alpha.openshift.io/local-with-fallback": "",
+			},
+			listenerCount:                         1,
+			overrideTestRunInClusterReachableHTTP: true,
+			hookE2eInit: func(cfg *e2eTestConfig) {
+				cfg.useAffinity = true
+				cfg.useProxyProtocolV2 = true
+			},
+			hookPostServiceConfig: func(cfg *e2eTestConfig) {
+				framework.Logf("running hook post-service-config patching service annotations to enforce LB pins/selects target to a single node: kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+				if cfg.svc.Annotations == nil {
+					cfg.svc.Annotations = map[string]string{}
+				}
+				cfg.svc.Annotations[annotationLBTargetNodeLabels] = fmt.Sprintf("kubernetes.io/hostname=%s", cfg.nodeSingleSample)
+
+				// ensure router configuration
+				// cfg.svc.ObjectMeta.Namespace = "openshift-ingress"
+				// cfg.svc.ObjectMeta.Name = "router-default-e2e"
+				cfg.svc.Spec.Selector = map[string]string{
+					"ingresscontroller.operator.openshift.io/deployment-ingresscontroller": "default",
+				}
+				cfg.svc.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeLocal
+				intPol := v1.ServiceInternalTrafficPolicyCluster
+				cfg.svc.Spec.InternalTrafficPolicy = &intPol
+				cfg.svc.Spec.Ports = []v1.ServicePort{
+					{
+						Name:     "http",
+						Protocol: v1.ProtocolTCP,
+						Port:     80,
+					},
+					{
+						Name:     "https",
+						Protocol: v1.ProtocolTCP,
+						Port:     443,
+					},
+				}
+				// Patch IngressController to use target group attributes for ingress load balancer
+				// TODO check if proxy protocol is enabled in the target group attributes and set it to CIO.
+				targetGroupAttrs := cfg.svc.Annotations[annotationLBTargetGroupAttributes]
+				framework.Logf("Patching OpenShift IngressController with target group attributes: %s", targetGroupAttrs)
+				err := patchOpenShiftIngressController(cfg, patchDataOpenShiftClusterIngressControllerCreate)
+				if err != nil {
+					framework.Logf("Warning: Failed to patch IngressController (this may be expected in non-OpenShift environments): %v", err)
+					// Don't fail the test if this is not an OpenShift cluster
+				}
+			},
 		},
 	}
 
-	serviceNameBase := "lbconfig-test"
+	serviceNameBase := "e2e-lb"
 	for _, tc := range cases {
 		It(tc.name, func() {
 			By("setting up test environment and discovering worker nodes")
-			e2e := newE2eTestConfig(cs)
+			e2e := newE2eTestConfig(cs, ns.Name)
+			if tc.hookE2eInit != nil {
+				framework.Logf("[HOOK] Executing e2e-init hook")
+				tc.hookE2eInit(e2e)
+			}
 			e2e.discoverClusterWorkerNode()
+
 			framework.Logf("[SETUP] Test case: %s", tc.name)
 			framework.Logf("[SETUP] Worker nodes discovered: %d nodes, selector: %s, sample node: %s", e2e.nodeCount, e2e.nodeSelector, e2e.nodeSingleSample)
 
@@ -231,9 +343,9 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			if len(tc.resourceSuffix) > 0 {
 				serviceName = serviceName + "-" + tc.resourceSuffix
 			}
-			framework.Logf("[CONFIG] Service name: %s, namespace: %s", serviceName, ns.Name)
+			framework.Logf("[CONFIG] Service name: %s, namespace: %s", serviceName, e2e.namespace)
 			e2e.newConfigServiceLB()
-			e2e.LBJig = e2eservice.NewTestJig(cs, ns.Name, serviceName)
+			e2e.LBJig = e2eservice.NewTestJig(cs, e2e.namespace, serviceName)
 
 			// Hook annotations to support dynamic config
 			e2e.svc = e2e.buildService(tc.listenerCount, tc.extraAnnotations)
@@ -259,9 +371,9 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			framework.Logf("[AWS] Load balancer provisioned successfully")
 
 			By("creating backend server pods")
-			_, err = e2e.LBJig.Run(e2e.buildReplicationController(tc.requireAffinity))
+			_, err = e2e.LBJig.Run(e2e.buildReplicationController())
 			framework.ExpectNoError(err)
-			framework.Logf("[K8S] Backend pods created, affinity required: %t", tc.requireAffinity)
+			framework.Logf("[K8S] Backend pods created")
 
 			if tc.hookPostServiceCreate != nil {
 				By("validating load balancer AWS resources")
@@ -290,7 +402,7 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			if tc.overrideTestRunInClusterReachableHTTP {
 				By("testing HTTP connectivity from within cluster (hairpinning)")
 				framework.Logf("[TEST] Running internal connectivity test from node: %s", e2e.nodeSingleSample)
-				err := inClusterTestReachableHTTP(cs, ns.Name, e2e.nodeSingleSample, ingressAddress, svcPort)
+				err := inClusterTestReachableHTTP(cs, e2e.namespace, e2e.nodeSingleSample, ingressAddress, svcPort)
 				if err != nil && tc.skipTestFailure {
 					Skip(err.Error())
 				}
@@ -322,6 +434,7 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 type e2eTestConfig struct {
 	ctx        context.Context
 	kubeClient clientset.Interface
+	namespace  string
 
 	// service configuration
 	cfgPortCount          int
@@ -329,6 +442,10 @@ type e2eTestConfig struct {
 	cfgPodProtocol        v1.Protocol
 	cfgDefaultAnnotations map[string]string
 	LBJig                 *e2eservice.TestJig
+
+	// service customizations
+	useAffinity        bool
+	useProxyProtocolV2 bool
 
 	// service instance
 	svc *v1.Service
@@ -339,7 +456,7 @@ type e2eTestConfig struct {
 	nodeSingleSample string
 }
 
-func newE2eTestConfig(cs clientset.Interface) *e2eTestConfig {
+func newE2eTestConfig(cs clientset.Interface, namespace string) *e2eTestConfig {
 	// Create a context with a reasonable timeout for e2e tests
 	// E2E tests can take several minutes for load balancer provisioning and configuration
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
@@ -347,6 +464,7 @@ func newE2eTestConfig(cs clientset.Interface) *e2eTestConfig {
 
 	return &e2eTestConfig{
 		kubeClient:   cs,
+		namespace:    namespace,
 		cfgPortCount: 2,
 		ctx:          ctx,
 	}
@@ -414,7 +532,7 @@ func (e2e *e2eTestConfig) buildService(portCount int, extraAnnotations map[strin
 // [1] https://github.com/kubernetes/kubernetes/blob/89d95c9713a8fd189e8ad555120838b3c4f888d1/test/e2e/framework/service/jig.go#L636
 // [2] https://github.com/kubernetes/kubernetes/issues/119021
 // [3] https://github.com/kubernetes/cloud-provider-aws/blob/master/tests/e2e/go.mod#L14
-func (e2e *e2eTestConfig) buildReplicationController(affinity bool) func(rc *v1.ReplicationController) {
+func (e2e *e2eTestConfig) buildReplicationController() func(rc *v1.ReplicationController) {
 	return func(rc *v1.ReplicationController) {
 		var replicas int32 = 1
 		var grace int64 = 3
@@ -433,8 +551,9 @@ func (e2e *e2eTestConfig) buildReplicationController(affinity bool) func(rc *v1.
 				Spec: v1.PodSpec{
 					Containers: []v1.Container{
 						{
-							Name:  "netexec",
-							Image: imageutils.GetE2EImage(imageutils.Agnhost),
+							Name: "netexec",
+							// Image: imageutils.GetE2EImage(imageutils.Agnhost),
+							Image: "quay.io/mrbraga/agnhost:v2.56-proxy-protocol-v2",
 							Args: []string{
 								"netexec",
 								fmt.Sprintf("--http-port=%d", e2e.cfgPodPort),
@@ -455,7 +574,12 @@ func (e2e *e2eTestConfig) buildReplicationController(affinity bool) func(rc *v1.
 				},
 			},
 		}
-		if affinity {
+		if e2e.useProxyProtocolV2 {
+			framework.Logf("[K8S] Enabling Proxy Protocol V2")
+			rc.Spec.Template.Spec.Containers[0].Args = append(rc.Spec.Template.Spec.Containers[0].Args, "--enable-proxy-protocol-v2")
+		}
+		if e2e.useAffinity {
+			framework.Logf("[K8S] Enabling Node Affinity")
 			rc.Spec.Template.Spec.Affinity = &v1.Affinity{
 				NodeAffinity: &v1.NodeAffinity{
 					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
@@ -787,5 +911,102 @@ func inClusterTestReachableHTTP(cs clientset.Interface, namespace, nodeName, tar
 		return errmsg
 	}
 
+	return nil
+}
+
+// patchOpenShiftIngressController patches the default IngressController in OpenShift
+// to configure load balancer behavior for ingress traffic
+func patchOpenShiftIngressController(e2e *e2eTestConfig, patchData map[string]interface{}) error {
+	// Get the rest config from the framework
+	restConfig, err := framework.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	// Create dynamic client for custom resources
+	dynamicClient, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Define IngressController GroupVersionResource
+	ingressControllerGVR := schema.GroupVersionResource{
+		Group:    "operator.openshift.io",
+		Version:  "v1",
+		Resource: "ingresscontrollers",
+	}
+
+	// Build patch data for NLB with target group attributes
+	// patchData := map[string]interface{}{
+	// 	"spec": map[string]interface{}{
+	// 		"endpointPublishingStrategy": map[string]interface{}{
+	// 			"type": "Private",
+	// 			"private": map[string]interface{}{
+	// 				"protocol": "PROXY",
+	// 			},
+	// 		},
+	// 	},
+	// }
+
+	// patchData := map[string]interface{}{
+	// 	"spec": map[string]interface{}{
+	// 		"endpointPublishingStrategy": map[string]interface{}{
+	// 			"type": "LoadBalancerService",
+	// 			"loadBalancer": map[string]interface{}{
+	// 				"scope": "External",
+	// 				"providerParameters": map[string]interface{}{
+	// 					"type": "AWS",
+	// 					"aws": map[string]interface{}{
+	// 						"type": "NLB",
+	// 						"nlbParameters": map[string]interface{}{
+	// 							"targetGroupAttributes": targetGroupAttributes,
+	// 						},
+	// 					},
+	// 				},
+	// 			},
+	// 		},
+	// 	},
+	// }
+
+	patchBytes, err := json.Marshal(patchData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch data: %w", err)
+	}
+
+	framework.Logf("Patching IngressController 'default' in namespace 'openshift-ingress-operator'")
+	framework.Logf("Patch data: %s", string(patchBytes))
+
+	// Apply patch to the default IngressController
+
+	if _, err = dynamicClient.Resource(ingressControllerGVR).
+		Namespace("openshift-ingress-operator").
+		Patch(
+			context.TODO(),
+			"default",
+			types.MergePatchType,
+			patchBytes,
+			metav1.PatchOptions{},
+		); err != nil {
+		return fmt.Errorf("failed to patch IngressController: %w", err)
+	}
+
+	if _, err = dynamicClient.Resource(ingressControllerGVR).
+		Namespace("openshift-ingress-operator").
+		Patch(
+			context.TODO(),
+			"default",
+			types.JSONPatchType,
+			[]byte(`[
+				{
+					"op": "remove",
+					"path": "/spec/endpointPublishingStrategy/loadBalancer"
+				}
+			]`),
+			metav1.PatchOptions{},
+		); err != nil {
+		return fmt.Errorf("failed to patch IngressController: %w", err)
+	}
+
+	framework.Logf("Successfully patched IngressController 'default'")
 	return nil
 }
