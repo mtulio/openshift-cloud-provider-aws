@@ -2217,31 +2217,63 @@ func (c *Cloud) buildNLBHealthCheckConfiguration(svc *v1.Service) (healthCheckCo
 //   - For new NLBs in managed mode: creates a new security group with proper tagging
 //   - For new NLBs in disabled mode: returns empty list (no security groups)
 func (c *Cloud) ensureNLBSecurityGroup(ctx context.Context, loadBalancerName string, serviceName types.NamespacedName, annotations map[string]string) ([]string, error) {
+	securityGroups := []string{}
+
+	// Describe the NLB to check if it exists and if it has security groups.
 	loadBalancer, err := c.describeLoadBalancerv2(ctx, loadBalancerName)
 	if err != nil {
-		return nil, fmt.Errorf("error describing load balancer %s: %w", loadBalancerName, err)
+		return securityGroups, fmt.Errorf("error describing load balancer %s: %w", loadBalancerName, err)
 	}
 
-	// Ensure the BYO annotation is not supported and return an error.
-	// FIXME: https://github.com/kubernetes/cloud-provider-aws/issues/1151
-	// The BYO SG for NLB implementation is blocked by bug fix https://github.com/kubernetes/cloud-provider-aws/pull/1209
-	if _, hasBYOAnnotation := annotations[ServiceAnnotationLoadBalancerSecurityGroups]; hasBYOAnnotation {
-		return nil, fmt.Errorf("BYO security group annotation %q is not supported for NLB", ServiceAnnotationLoadBalancerSecurityGroups)
-	}
-
-	if loadBalancer != nil && len(loadBalancer.SecurityGroups) == 0 {
-		// NLB exists with no security groups, return empty list.
-		return nil, nil
-	} else if loadBalancer != nil && len(loadBalancer.SecurityGroups) > 0 {
-		// NLB created with security group support.
+	// NLB created with security group support.
+	if loadBalancer != nil && len(loadBalancer.SecurityGroups) > 0 {
+		// Check if there's a BYO security group annotation and validate it
+		if byoSGAnnotation, hasBYOAnnotation := annotations[ServiceAnnotationLoadBalancerSecurityGroups]; hasBYOAnnotation {
+			byoSecurityGroups := getSGListFromAnnotation(byoSGAnnotation)
+			if len(byoSecurityGroups) == 0 {
+				return nil, fmt.Errorf("unable to parse security group list from annotation %q", ServiceAnnotationLoadBalancerSecurityGroups)
+			}
+			return byoSecurityGroups, nil
+		}
 		return loadBalancer.SecurityGroups, nil
+
+	} else if loadBalancer != nil {
+		// NLB exists with no security groups, return empty list.
+		return loadBalancer.SecurityGroups, nil
+	}
+
+	// Handle new NLB case
+	// Check for BYO security group annotation first
+	if byoSGAnnotation, hasBYOAnnotation := annotations[ServiceAnnotationLoadBalancerSecurityGroups]; hasBYOAnnotation {
+		byoSecurityGroups := getSGListFromAnnotation(byoSGAnnotation)
+		if len(byoSecurityGroups) == 0 {
+			return nil, fmt.Errorf("unable to parse security group list from annotation %q", ServiceAnnotationLoadBalancerSecurityGroups)
+		}
+		if len(byoSecurityGroups) > 1 {
+			return nil, fmt.Errorf("multiple security groups %v are not supported for annotation %q", byoSecurityGroups, ServiceAnnotationLoadBalancerSecurityGroups)
+		}
+		// Validate security group format
+		byoSG := byoSecurityGroups[0]
+		if !strings.HasPrefix(byoSG, "sg-") || len(byoSG) < 11 {
+			return nil, fmt.Errorf("security group %q is not a valid security group", byoSG)
+		}
+
+		klog.Infof("Using security group %q for service %q on NLB %q", byoSG, serviceName, loadBalancerName)
+		return []string{byoSG}, nil
+	}
+
+	// Check for global BYO security group configuration
+	if c.cfg.Global.ElbSecurityGroup != "" {
+		klog.Infof("Using Global security group %q for service %q on NLB %q", c.cfg.Global.ElbSecurityGroup, serviceName, loadBalancerName)
+		return []string{c.cfg.Global.ElbSecurityGroup}, nil
 	}
 
 	// Do nothing when NLB was not created with SG support or is not managed by the controller.
 	if !c.cfg.IsNLBSecurityGroupModeManaged() {
-		return nil, nil
+		return securityGroups, nil
 	}
 
+	// Create a new security group.
 	sgName := securityGroupPrefix + loadBalancerName
 	klog.Infof("Creating NLB security group %q for service %q", sgName, serviceName)
 	securityGroupID, err := c.createSecurityGroup(
@@ -2254,7 +2286,8 @@ func (c *Cloud) ensureNLBSecurityGroup(ctx context.Context, loadBalancerName str
 	}
 	klog.Infof("Created NLB security group %q for service %q", securityGroupID, serviceName)
 
-	return []string{securityGroupID}, nil
+	securityGroups = append(securityGroups, securityGroupID)
+	return securityGroups, nil
 }
 
 // ensureNLBSecurityGroupRules ensures the NLB security group rules are created and configured
@@ -2275,16 +2308,18 @@ func (c *Cloud) ensureNLBSecurityGroup(ctx context.Context, loadBalancerName str
 // Behavior:
 //   - Does nothing if no security groups are provided
 //   - Creates ingress rules for each frontend port/protocol in v2Mappings
-//   - Uses the first security group ID from the provided list to ensure rules (standard behavior on CCM)
-//   - Allows traffic from all provided source ranges
+//   - Uses the first security group ID from the provided list
+//   - Allows traffic from all specified source ranges
 func (c *Cloud) ensureNLBSecurityGroupRules(ctx context.Context, securityGroups []string, ec2SourceRanges []ec2types.IpRange, v2Mappings []nlbPortMapping) error {
 	if len(securityGroups) == 0 {
 		return nil
 	}
 	securityGroupID := securityGroups[0]
 
+	// Create frontend ingress rules based in the LoadBalancer listeners.
 	ingressRules := NewIPPermissionSet()
 	for _, mapping := range v2Mappings {
+		// create ingress permissions: iteract over Load Balancer Listener mappings to create ingress rules
 		ingressRules.Insert(ec2types.IpPermission{
 			FromPort:   aws.Int32(int32(mapping.FrontendPort)),
 			ToPort:     aws.Int32(int32(mapping.FrontendPort)),
@@ -2420,6 +2455,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			instanceIDs = append(instanceIDs, string(id))
 		}
 
+		// Create NLB with security group support when the configuration is added.
 		securityGroups, err := c.ensureNLBSecurityGroup(ctx,
 			loadBalancerName,
 			serviceName,
@@ -2442,7 +2478,7 @@ func (c *Cloud) EnsureLoadBalancer(ctx context.Context, clusterName string, apiS
 			return nil, err
 		}
 
-		// Ensure SG rules only if the LB reconciliator finished successfully.
+		// Ensure SG rules only if the LB reconciliator is successful.
 		if err := c.ensureNLBSecurityGroupRules(ctx, securityGroups, ec2SourceRanges, v2Mappings); err != nil {
 			return nil, fmt.Errorf("error ensuring NLB security group rules: %w", err)
 		}
