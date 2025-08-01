@@ -45,6 +45,7 @@ const (
 	annotationLBInternal              = "service.beta.kubernetes.io/aws-load-balancer-internal"
 	annotationLBTargetNodeLabels      = "service.beta.kubernetes.io/aws-load-balancer-target-node-labels"
 	annotationLBTargetGroupAttributes = "service.beta.kubernetes.io/aws-load-balancer-target-group-attributes"
+	annotationLBSecurityGroups        = "service.beta.kubernetes.io/aws-load-balancer-security-groups"
 )
 
 var (
@@ -247,6 +248,78 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 				}
 			},
 		},
+		// BYO Security Group tests.
+		// The "CLB with managed security group mut update to BYO..." must  validate the features:
+		// - existing Service CLB with managed SG have correct tags
+		// - existing Service CLB with managed SG is updated to BYO SG (user-provided) through annotation
+		// - controller removes the managed SG when BYO SG is applied
+		// - load balancer is reachable after the update
+		{
+			name:           "CLB with managed Security Group must update to BYO Security Group",
+			resourceSuffix: "clb-sg",
+			listenerCount:  1,
+			hookPreTest: func(cfg *e2eTestConfig) {
+				framework.Logf("running hook post-service-config patching service annotation with BYO security group")
+				isNLB := false
+				lbDNS := cfg.svc.Status.LoadBalancer.Ingress[0].Hostname
+
+				managedSecurityGroups, err := cfg.awsHelper.getLoadBalancerSecurityGroups(isNLB, lbDNS)
+				framework.ExpectNoError(err, "Failed to get load balancer security groups")
+				framework.Logf("Load balancer %s has security groups: %+v", lbDNS, managedSecurityGroups)
+
+				for _, sgID := range managedSecurityGroups {
+					managed, err := cfg.awsHelper.isSecurityGroupManaged(sgID)
+					framework.ExpectNoError(err, fmt.Sprintf("Failed to check if security group %q is managed", sgID))
+					if !managed {
+						framework.Failf("Security group %q is not managed by the controller", sgID)
+					}
+				}
+
+				securityGroupName := cfg.svc.Namespace + "-" + cfg.svc.Name + "-sg-byo"
+				cfg.byoSecurityGroupID, err = cfg.awsHelper.createSecurityGroup(securityGroupName, fmt.Sprintf("BYO Security Group for e2e test service %s/%s", cfg.svc.Namespace, cfg.svc.Name))
+				framework.ExpectNoError(err, "Failed to create BYO security group")
+
+				// Currently controller does not update rules for BYO SG.
+				// TODO: Verify if controller needs to update rules for BYO SG.
+				framework.ExpectNoError(cfg.awsHelper.authorizeSecurityGroupToPorts(cfg.byoSecurityGroupID, cfg.svc.Spec.Ports), "Failed to authorize BYO security group to service ports")
+
+				// Verify the rules were actually created
+				framework.ExpectNoError(cfg.awsHelper.verifySecurityGroupRules(cfg.byoSecurityGroupID, cfg.svc.Spec.Ports), "Failed to verify BYO security group rules")
+
+				framework.Logf("Patching Service %q with BYO SG %q", cfg.svc.Name, cfg.byoSecurityGroupID)
+				cfg.svc.Annotations[annotationLBSecurityGroups] = cfg.byoSecurityGroupID
+				newSvc, err := cfg.kubeClient.CoreV1().Services(cfg.LBJig.Namespace).Update(cfg.ctx, cfg.svc, metav1.UpdateOptions{})
+				framework.ExpectNoError(err, "Failed to update Kubernetes Service")
+				cfg.svc = newSvc
+
+				time.Sleep(10 * time.Second)
+
+				byoSecurityGroups, err := cfg.awsHelper.getLoadBalancerSecurityGroups(isNLB, lbDNS)
+				framework.ExpectNoError(err, "Failed to get load balancer security groups")
+
+				framework.Logf("Load balancer %s has security groups: %+v", lbDNS, byoSecurityGroups)
+				for _, sgID := range byoSecurityGroups {
+					if sgID == cfg.byoSecurityGroupID {
+						break
+					}
+					framework.Failf("Load balancer %s has different security group than expected. Want=%q got=%q", lbDNS, cfg.byoSecurityGroupID, sgID)
+				}
+
+				framework.Logf("Checking if managed SGs were removed")
+				for _, sgID := range managedSecurityGroups {
+					sg, err := cfg.awsHelper.getSecurityGroup(sgID)
+					if err != nil && strings.Contains(err.Error(), "InvalidGroup.NotFound") {
+						framework.Logf("Managed security group %q removed", sgID)
+						break
+					}
+					if sg != nil {
+						framework.Failf("expected managed security group %q removed by controller, got %q", sgID, aws.ToString(sg.GroupId))
+					}
+					framework.Failf("managed security group %q was not removed by controller: %v", sgID, err)
+				}
+				framework.Logf("pre-test hook completed")
+			},
+		},
 	}
 
 	serviceNameBase := "lbconfig-test"
@@ -255,6 +328,8 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			By("setting up test environment and discovering worker nodes")
 			e2e := newE2eTestConfig(cs)
 			e2e.discoverClusterWorkerNode()
+			defer e2e.cleanup()
+
 			framework.Logf("[SETUP] Test case: %s", tc.name)
 			framework.Logf("[SETUP] Worker nodes discovered: %d nodes, selector: %s, sample node: %s", e2e.nodeCount, e2e.nodeSelector, e2e.nodeSingleSample)
 
@@ -377,11 +452,11 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			if tc.overrideTestRunInClusterReachableHTTP {
 				By("testing HTTP connectivity for internal load balancer")
 				framework.Logf("[TEST] Running internal connectivity test from node: %s", e2e.nodeSingleSample)
-				err := inClusterTestReachableHTTP(cs, ns.Name, e2e.nodeSingleSample, ingressAddress, svcPort)
+				err := e2e.inClusterTestReachableHTTP(ingressAddress, svcPort)
 				if err != nil && tc.skipTestFailure {
 					Skip(err.Error())
 				}
-				framework.ExpectNoError(err)
+				framework.ExpectNoError(err, "Failed to test HTTP connectivity from internal network")
 			} else {
 				By("testing HTTP connectivity for external/internet-facing load balancer")
 				framework.Logf("[TEST] Running external connectivity test to %s:%d", ingressAddress, svcPort)
@@ -394,13 +469,13 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 			_, err = e2e.LBJig.UpdateService(ctx, func(s *v1.Service) {
 				s.Spec.Type = v1.ServiceTypeClusterIP
 			})
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(err, "Failed to update service to ClusterIP")
 
 			// Wait for the load balancer to be destroyed asynchronously
 			By("cleaning up: waiting for load balancer destruction")
 			framework.Logf("[CLEANUP] Waiting for load balancer destruction")
 			_, err = e2e.LBJig.WaitForLoadBalancerDestroy(ctx, ingressAddress, svcPort, loadBalancerCreateTimeout)
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(err, "Failed to wait for load balancer destruction")
 			framework.Logf("[CLEANUP] Load balancer destroyed successfully")
 		})
 	}
@@ -409,6 +484,11 @@ var _ = Describe("[cloud-provider-aws-e2e] loadbalancer", func() {
 type e2eTestConfig struct {
 	ctx        context.Context
 	kubeClient clientset.Interface
+
+	// AWS helper
+	awsHelper *awsHelper
+
+	byoSecurityGroupID string
 
 	// service configuration
 	cfgPortCount          int
@@ -432,6 +512,9 @@ func newE2eTestConfig(cs clientset.Interface) *e2eTestConfig {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	_ = cancel // We'll let the test framework handle cleanup
 
+	h, err := newAWSHelper(ctx, cs)
+	framework.ExpectNoError(err, "Failed to create AWS helper")
+
 	return &e2eTestConfig{
 		kubeClient:     cs,
 		cfgPortCount:   2,
@@ -442,6 +525,7 @@ func newE2eTestConfig(cs clientset.Interface) *e2eTestConfig {
 			"aws-load-balancer-backend-protocol": "http",
 			"aws-load-balancer-ssl-ports":        "https",
 		},
+		awsHelper: h,
 	}
 }
 
