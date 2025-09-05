@@ -2,6 +2,7 @@
 /ecr-credential-provider
 /ecr-credential-provider.exe
 /cloudconfig
+/ccm-aws-tests-ext
 _output/
 /kops-example
 docs/book/_book/
