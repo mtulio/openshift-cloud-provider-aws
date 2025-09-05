@@ -72,6 +72,13 @@ ecr-credential-provider-windows-amd64:
 		-o=ecr-credential-provider-windows-amd64 \
 		cmd/ecr-credential-provider/*.go
 
+.PHONY: ccm-aws-tests-ext
+ccm-aws-tests-ext:
+	 cd ./tests/ccm-aws-tests-ext && GO111MODULE=on CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) GOPROXY=$(GOPROXY) go build \
+		-trimpath \
+		-ldflags="$(LDFLAGS)" \
+		-o=../../ccm-aws-tests-ext .
+
 .PHONY: docker-build-amd64
 docker-build-amd64:
 	docker buildx build --output=type=docker \
